@@ -1,0 +1,7 @@
+ollama
+rich
+python-dotenv
+sqlalchemy
+toml
+requests
+httpx
