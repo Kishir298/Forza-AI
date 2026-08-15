@@ -5,3 +5,4 @@ sqlalchemy
 toml
 requests
 httpx
+psutil
