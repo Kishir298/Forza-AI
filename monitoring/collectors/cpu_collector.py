@@ -1,80 +1,140 @@
 import platform
-import subprocess
-
 import psutil
 
 
-def get_cpu_model():
-    """Detect the CPU model on Windows, macOS, and Linux."""
-
+def _get_cpu_model():
     system = platform.system()
 
-    try:
-        if system == "Windows":
-            result = subprocess.check_output(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    "(Get-CimInstance Win32_Processor).Name",
-                ],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
+    if system == "Windows":
+        return platform.processor() or None
 
-            if result:
-                return result
+    if system == "Darwin":
+        try:
+            import subprocess
 
-        elif system == "Darwin":
-            result = subprocess.check_output(
+            result = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
                 text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
+                timeout=3,
+                check=False,
+            )
 
-            if result:
-                return result
+            if result.returncode == 0:
+                return result.stdout.strip() or None
 
-        elif system == "Linux":
+        except Exception:
+            pass
+
+    if system == "Linux":
+        try:
             with open("/proc/cpuinfo", "r", encoding="utf-8") as file:
                 for line in file:
                     if line.lower().startswith("model name"):
                         return line.split(":", 1)[1].strip()
 
-    except (OSError, subprocess.SubprocessError, FileNotFoundError):
-        pass
+        except Exception:
+            pass
 
-    return platform.processor() or "Unknown"
+    return platform.processor() or None
+
+
+def _get_cpu_frequency():
+    try:
+        frequency = psutil.cpu_freq()
+
+        if frequency is None:
+            return None
+
+        return {
+            "current_mhz": round(frequency.current, 2)
+            if frequency.current
+            else None,
+
+            "min_mhz": round(frequency.min, 2)
+            if frequency.min
+            else None,
+
+            "max_mhz": round(frequency.max, 2)
+            if frequency.max
+            else None,
+        }
+
+    except Exception:
+        return None
+
+
+def _get_core_usage():
+    try:
+        values = psutil.cpu_percent(
+            interval=0.5,
+            percpu=True,
+        )
+
+        return [
+            round(value, 1)
+            for value in values
+        ]
+
+    except Exception:
+        return []
 
 
 def get_cpu():
-    """Return CPU information."""
+    """
+    Collect current CPU information.
 
-    model = get_cpu_model()
+    This collector only gathers raw/current CPU information.
+    Historical averages and analysis belong to the processing layer.
+    """
 
-    physical_cores = psutil.cpu_count(logical=False)
-    threads = psutil.cpu_count(logical=True)
+    try:
+        physical_cores = psutil.cpu_count(logical=False)
+        logical_cores = psutil.cpu_count(logical=True)
 
-    usage_percent = psutil.cpu_percent(interval=0.2)
+        usage_percent = psutil.cpu_percent(interval=0.5)
 
-    core_usage = psutil.cpu_percent(
-        interval=0.2,
-        percpu=True,
-    )
+        frequency = _get_cpu_frequency()
+        core_usage = _get_core_usage()
 
-    frequency = psutil.cpu_freq()
+        return {
+            "component": "CPU",
+            "available": True,
 
-    frequency_mhz = None
+            # Identification
+            "model": _get_cpu_model(),
+            "architecture": platform.machine(),
 
-    if frequency:
-        frequency_mhz = round(frequency.current, 1)
+            # Core configuration
+            "physical_cores": physical_cores,
+            "logical_cores": logical_cores,
 
-    return {
-        "component": "CPU",
-        "model": model,
-        "physical_cores": physical_cores,
-        "threads": threads,
-        "usage_percent": round(usage_percent, 1),
-        "core_usage": [round(value, 1) for value in core_usage],
-        "frequency_mhz": frequency_mhz,
-    }
+            # Current usage
+            "usage_percent": round(
+                usage_percent,
+                1,
+            ),
+
+            "core_usage": core_usage,
+
+            # Frequency
+            "frequency": frequency,
+        }
+
+    except Exception as error:
+        return {
+            "component": "CPU",
+            "available": False,
+            "error": str(error),
+
+            "model": None,
+            "architecture": None,
+
+            "physical_cores": None,
+            "logical_cores": None,
+
+            "usage_percent": None,
+            "core_usage": [],
+
+            "frequency": None,
+        }
