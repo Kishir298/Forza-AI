@@ -1,182 +1,372 @@
+import json
 import platform
-import re
 import subprocess
 
+import screeninfo
 
-def get_windows_display():
-    """Get display information on Windows."""
 
-    displays = []
+def _get_monitors():
+    """
+    Get basic physical/logical monitor information using screeninfo.
+    """
 
     try:
-        command = (
-            "Get-CimInstance -Namespace root\\wmi "
-            "-ClassName WmiMonitorBasicDisplayParams | "
-            "ForEach-Object { "
-            "$size = [math]::Sqrt("
-            "$_.MaxHorizontalImageSize * $_.MaxHorizontalImageSize + "
-            "$_.MaxVerticalImageSize * $_.MaxVerticalImageSize"
-            "); "
-            "[PSCustomObject]@{"
-            "WidthCM=$_.MaxHorizontalImageSize;"
-            "HeightCM=$_.MaxVerticalImageSize;"
-            "Active=$_.Active"
-            "} "
-            "} | ConvertTo-Csv -NoTypeInformation"
-        )
+        monitors = screeninfo.get_monitors()
 
-        result = subprocess.check_output(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command,
-            ],
+        return [
+            {
+                "name": monitor.name,
+                "x": monitor.x,
+                "y": monitor.y,
+                "width": monitor.width,
+                "height": monitor.height,
+                "is_primary": bool(
+                    getattr(monitor, "is_primary", False)
+                ),
+            }
+            for monitor in monitors
+        ]
+
+    except Exception:
+        return []
+
+
+def _get_windows_details():
+    """
+    Get Windows display/GPU information.
+    """
+
+    details = []
+
+    if platform.system() != "Windows":
+        return details
+
+    try:
+        command = [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            """
+            Get-CimInstance Win32_VideoController |
+            Select-Object Name, AdapterRAM, DriverVersion,
+                          VideoModeDescription, CurrentRefreshRate,
+                          CurrentHorizontalResolution,
+                          CurrentVerticalResolution |
+            ConvertTo-Json -Compress
+            """,
+        ]
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
             text=True,
-            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
         )
 
-        lines = result.strip().splitlines()
+        if result.returncode != 0 or not result.stdout.strip():
+            return details
 
-        if len(lines) > 1:
-            headers = [
-                value.strip('"')
-                for value in lines[0].split(",")
-            ]
+        data = json.loads(result.stdout)
 
-            for line in lines[1:]:
-                values = [
-                    value.strip('"')
-                    for value in line.split(",")
-                ]
+        if isinstance(data, dict):
+            data = [data]
 
-                if len(values) != len(headers):
-                    continue
+        for gpu in data:
+            adapter_ram = gpu.get("AdapterRAM")
 
-                data = dict(zip(headers, values))
+            details.append(
+                {
+                    "gpu": gpu.get("Name"),
+                    "driver_version": gpu.get(
+                        "DriverVersion"
+                    ),
 
-                displays.append(
-                    {
-                        "width_cm": int(float(data["WidthCM"])),
-                        "height_cm": int(float(data["HeightCM"])),
-                        "active": data["Active"].lower() == "true",
-                    }
-                )
+                    "vram_bytes": adapter_ram,
 
-    except (
-        OSError,
-        subprocess.SubprocessError,
-        ValueError,
-        KeyError,
-    ):
+                    "resolution": gpu.get(
+                        "VideoModeDescription"
+                    ),
+
+                    "refresh_rate_hz": gpu.get(
+                        "CurrentRefreshRate"
+                    ),
+
+                    "horizontal_resolution": gpu.get(
+                        "CurrentHorizontalResolution"
+                    ),
+
+                    "vertical_resolution": gpu.get(
+                        "CurrentVerticalResolution"
+                    ),
+                }
+            )
+
+    except Exception:
         pass
 
-    return displays
+    return details
 
 
-def get_macos_display():
-    """Get display information on macOS."""
+def _get_macos_details():
+    """
+    Get display information from macOS system_profiler.
+    """
 
-    displays = []
+    details = []
+
+    if platform.system() != "Darwin":
+        return details
 
     try:
-        result = subprocess.check_output(
+        result = subprocess.run(
             [
                 "system_profiler",
                 "SPDisplaysDataType",
+                "-json",
             ],
+            capture_output=True,
             text=True,
-            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
         )
 
-        for line in result.splitlines():
-            line = line.strip()
+        if result.returncode != 0:
+            return details
 
-            if "Resolution:" in line:
-                resolution = line.split(
-                    "Resolution:",
-                    1,
-                )[1].strip()
+        data = json.loads(result.stdout)
 
-                displays.append(
+        for gpu in data.get(
+            "SPDisplaysDataType",
+            [],
+        ):
+            gpu_name = gpu.get(
+                "sppci_model"
+            )
+
+            vram = gpu.get(
+                "sppci_vram"
+            )
+
+            for display in gpu.get(
+                "spdisplays_ndrvs",
+                [],
+            ):
+                details.append(
                     {
-                        "resolution": resolution,
+                        "gpu": gpu_name,
+                        "model": display.get(
+                            "_name"
+                        ),
+
+                        "vram": vram,
+
+                        "resolution": display.get(
+                            "_spdisplays_resolution"
+                        ),
+
+                        "retina": display.get(
+                            "spdisplays_retina"
+                        ),
                     }
                 )
 
-    except (
-        OSError,
-        subprocess.SubprocessError,
-    ):
+    except Exception:
         pass
 
-    return displays
+    return details
 
 
-def get_linux_display():
-    """Get display information on Linux."""
+def _get_linux_details():
+    """
+    Get display information through xrandr where available.
+    """
 
-    displays = []
+    details = []
+
+    if platform.system() != "Linux":
+        return details
 
     try:
-        result = subprocess.check_output(
-            [
-                "xrandr",
-                "--query",
-            ],
+        result = subprocess.run(
+            ["xrandr", "--query"],
+            capture_output=True,
             text=True,
-            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
         )
 
-        for line in result.splitlines():
+        if result.returncode != 0:
+            return details
+
+        for line in result.stdout.splitlines():
 
             if " connected" not in line:
                 continue
 
-            match = re.search(
-                r"(\d+)x(\d+)\+\d+\+\d+",
-                line,
+            parts = line.split()
+
+            name = parts[0]
+
+            resolution = None
+            refresh_rate = None
+
+            for part in parts:
+
+                if "x" in part:
+                    resolution_candidate = (
+                        part.split("+")[0]
+                    )
+
+                    if (
+                        resolution_candidate
+                        .replace("x", "")
+                        .isdigit()
+                    ):
+                        resolution = (
+                            resolution_candidate
+                        )
+
+                if part.endswith("*"):
+                    try:
+                        refresh_rate = float(
+                            part.rstrip("*+")
+                        )
+                    except ValueError:
+                        pass
+
+            details.append(
+                {
+                    "name": name,
+                    "resolution": resolution,
+                    "refresh_rate_hz": refresh_rate,
+                }
             )
 
-            if match:
-                displays.append(
-                    {
-                        "width": int(match.group(1)),
-                        "height": int(match.group(2)),
-                    }
-                )
-
-    except (
-        OSError,
-        subprocess.SubprocessError,
-    ):
+    except Exception:
         pass
 
-    return displays
+    return details
+
+
+def _get_platform_details():
+    system = platform.system()
+
+    if system == "Windows":
+        return _get_windows_details()
+
+    if system == "Darwin":
+        return _get_macos_details()
+
+    if system == "Linux":
+        return _get_linux_details()
+
+    return []
 
 
 def get_display():
     """
-    Return display information.
+    Collect current display information.
 
-    Supports Windows, macOS, and Linux.
+    This collector only reports display state/specifications.
+
+    Brightness changing, screen mirroring, AirPlay and other
+    display controls belong to the controller layer.
     """
 
-    system = platform.system()
+    monitors = _get_monitors()
+    platform_details = _get_platform_details()
 
-    if system == "Windows":
-        displays = get_windows_display()
+    displays = []
 
-    elif system == "Darwin":
-        displays = get_macos_display()
+    for index, monitor in enumerate(monitors):
 
-    elif system == "Linux":
-        displays = get_linux_display()
+        width = monitor.get("width")
+        height = monitor.get("height")
 
-    else:
-        displays = []
+        orientation = None
+
+        if width and height:
+
+            if width > height:
+                orientation = "landscape"
+
+            elif height > width:
+                orientation = "portrait"
+
+            else:
+                orientation = "square"
+
+        display = {
+            "index": index,
+
+            "name": monitor.get("name"),
+            "model": None,
+            "manufacturer": None,
+
+            "width": width,
+            "height": height,
+
+            "resolution": (
+                f"{width}x{height}"
+                if width and height
+                else None
+            ),
+
+            "refresh_rate_hz": None,
+
+            "orientation": orientation,
+
+            "is_primary": monitor.get(
+                "is_primary",
+                False,
+            ),
+
+            "scaling": None,
+            "brightness_percent": None,
+            "hdr": None,
+
+            "connection_type": None,
+
+            "gpu": None,
+            "gpu_driver": None,
+            "vram_bytes": None,
+        }
+
+        if index < len(platform_details):
+
+            details = platform_details[index]
+
+            display["gpu"] = details.get(
+                "gpu"
+            )
+
+            display["gpu_driver"] = details.get(
+                "driver_version"
+            )
+
+            display["vram_bytes"] = details.get(
+                "vram_bytes"
+            )
+
+            refresh_rate = details.get(
+                "refresh_rate_hz"
+            )
+
+            if refresh_rate:
+                display["refresh_rate_hz"] = (
+                    refresh_rate
+                )
+
+            model = details.get(
+                "model"
+            )
+
+            if model:
+                display["model"] = model
+
+        displays.append(display)
 
     return {
         "component": "Display",
