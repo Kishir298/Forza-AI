@@ -1,8 +1,10 @@
-ollama
+-r requirements/hardware.txt
+-r requirements/ai.txt
+-r requirements/development.txt
+
 rich
 python-dotenv
 sqlalchemy
 toml
 requests
 httpx
-psutil
