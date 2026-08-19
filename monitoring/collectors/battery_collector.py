@@ -2,28 +2,24 @@ import glob
 import json
 import os
 import platform
+import re
 import subprocess
+import tempfile
+from html import unescape
 
 import psutil
 
 
-def _run_powershell(command, timeout=6):
+def _run_command(command, timeout=8):
     """
-    Execute PowerShell and return parsed JSON.
-    """
+    Run a command and return stdout.
 
-    if platform.system() != "Windows":
-        return None
+    Returns None if the command cannot be executed or fails.
+    """
 
     try:
         result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                command,
-            ],
+            command,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -38,13 +34,47 @@ def _run_powershell(command, timeout=6):
         if not output:
             return None
 
-        return json.loads(output)
+        return output
 
     except Exception:
         return None
 
 
+def _run_powershell(command, timeout=8):
+    """
+    Execute PowerShell and return parsed JSON.
+    """
+
+    if platform.system() != "Windows":
+        return None
+
+    output = _run_command(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        timeout=timeout,
+    )
+
+    if not output:
+        return None
+
+    try:
+        return json.loads(output)
+    except Exception:
+        return None
+
+
 def _normalize_list(value):
+    """
+    Normalize PowerShell JSON output into a list.
+    """
+
     if value is None:
         return []
 
@@ -58,6 +88,10 @@ def _normalize_list(value):
 
 
 def _clean_string(value):
+    """
+    Normalize optional string values.
+    """
+
     if value is None:
         return None
 
@@ -66,7 +100,47 @@ def _clean_string(value):
     return value if value else None
 
 
+def _safe_float(value):
+    """
+    Convert a value to float safely.
+    """
+
+    try:
+        if value is None:
+            return None
+
+        return float(value)
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _safe_int(value):
+    """
+    Convert a value to int safely.
+    """
+
+    try:
+        if value is None:
+            return None
+
+        return int(float(value))
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
 def _empty_details():
+    """
+    Default battery hardware/telemetry structure.
+    """
+
     return {
         "manufacturer": None,
         "model": None,
@@ -83,12 +157,14 @@ def _empty_details():
         "power_w": None,
 
         "temperature_c": None,
+
+        "sources": [],
     }
 
 
 def _get_basic_battery():
     """
-    Common battery state from psutil.
+    Get common battery state using psutil.
     """
 
     try:
@@ -99,11 +175,15 @@ def _get_basic_battery():
 
         seconds_remaining = battery.secsleft
 
-        if seconds_remaining in (
+        unknown_values = {
             psutil.POWER_TIME_UNKNOWN,
             psutil.POWER_TIME_UNLIMITED,
             4294967295,
-        ):
+            -1,
+            -2,
+        }
+
+        if seconds_remaining in unknown_values:
             seconds_remaining = None
 
         if (
@@ -112,23 +192,23 @@ def _get_basic_battery():
         ):
             seconds_remaining = None
 
-        if battery.power_plugged:
+        plugged = bool(
+            battery.power_plugged
+        )
+
+        if plugged:
             status = "Charging"
         else:
             status = "Discharging"
 
         return {
             "percentage": round(
-                battery.percent,
+                float(battery.percent),
                 1,
             ),
             "status": status,
-            "charging": bool(
-                battery.power_plugged
-            ),
-            "power_plugged": bool(
-                battery.power_plugged
-            ),
+            "charging": plugged,
+            "power_plugged": plugged,
             "seconds_remaining": (
                 int(seconds_remaining)
                 if seconds_remaining is not None
@@ -142,10 +222,10 @@ def _get_basic_battery():
 
 def _get_windows_static_data():
     """
-    Get static battery information.
+    Collect Windows battery static information.
 
-    Different Windows firmware exposes different subsets
-    of these WMI classes, so each class is queried separately.
+    Uses several Windows WMI/ACPI classes because battery
+    firmware does not expose every field consistently.
     """
 
     details = _empty_details()
@@ -174,41 +254,39 @@ def _get_windows_static_data():
     if static_data:
         item = static_data[0]
 
-        designed = item.get(
-            "DesignedCapacity"
+        designed = _safe_float(
+            item.get(
+                "DesignedCapacity"
+            )
         )
 
-        full_charge = item.get(
-            "FullChargedCapacity"
+        full_charge = _safe_float(
+            item.get(
+                "FullChargedCapacity"
+            )
         )
 
-        if designed is not None:
-            try:
-                details[
-                    "design_capacity_wh"
-                ] = round(
-                    float(designed) / 1000,
-                    3,
-                )
-            except (
-                TypeError,
-                ValueError,
-            ):
-                pass
+        if (
+            designed is not None
+            and designed > 0
+        ):
+            details[
+                "design_capacity_wh"
+            ] = round(
+                designed / 1000,
+                3,
+            )
 
-        if full_charge is not None:
-            try:
-                details[
-                    "full_charge_capacity_wh"
-                ] = round(
-                    float(full_charge) / 1000,
-                    3,
-                )
-            except (
-                TypeError,
-                ValueError,
-            ):
-                pass
+        if (
+            full_charge is not None
+            and full_charge > 0
+        ):
+            details[
+                "full_charge_capacity_wh"
+            ] = round(
+                full_charge / 1000,
+                3,
+            )
 
         details[
             "manufacturer"
@@ -224,6 +302,12 @@ def _get_windows_static_data():
             item.get(
                 "DeviceName"
             )
+        )
+
+        details[
+            "sources"
+        ].append(
+            "Windows BatteryStaticData"
         )
 
     # ---------------------------------------------------------
@@ -244,23 +328,32 @@ def _get_windows_static_data():
     )
 
     if full_capacity_data:
-        value = full_capacity_data[0].get(
-            "FullChargedCapacity"
+        value = _safe_float(
+            full_capacity_data[0].get(
+                "FullChargedCapacity"
+            )
         )
 
-        if value is not None:
-            try:
-                details[
-                    "full_charge_capacity_wh"
-                ] = round(
-                    float(value) / 1000,
-                    3,
-                )
-            except (
-                TypeError,
-                ValueError,
+        if (
+            value is not None
+            and value > 0
+        ):
+            details[
+                "full_charge_capacity_wh"
+            ] = round(
+                value / 1000,
+                3,
+            )
+
+            if (
+                "Windows BatteryFullChargedCapacity"
+                not in details["sources"]
             ):
-                pass
+                details[
+                    "sources"
+                ].append(
+                    "Windows BatteryFullChargedCapacity"
+                )
 
     # ---------------------------------------------------------
     # BatteryCycleCount
@@ -280,27 +373,35 @@ def _get_windows_static_data():
     )
 
     if cycle_data:
-        value = cycle_data[0].get(
-            "CycleCount"
+        value = _safe_int(
+            cycle_data[0].get(
+                "CycleCount"
+            )
         )
 
-        if value is not None:
-            try:
-                details[
-                    "cycle_count"
-                ] = int(value)
-            except (
-                TypeError,
-                ValueError,
-            ):
-                pass
+        # Zero is treated as unavailable because many
+        # Windows firmware implementations expose 0 when
+        # cycle telemetry is unsupported.
+        if (
+            value is not None
+            and value > 0
+        ):
+            details[
+                "cycle_count"
+            ] = value
+
+            details[
+                "sources"
+            ].append(
+                "Windows BatteryCycleCount"
+            )
 
     return details
 
 
 def _get_windows_status_data():
     """
-    Get dynamic battery information.
+    Collect live Windows battery telemetry.
 
     BatteryStatus provides:
     - Voltage
@@ -314,6 +415,7 @@ def _get_windows_status_data():
         "voltage_mv": None,
         "current_ma": None,
         "power_w": None,
+        "sources": [],
     }
 
     data = _normalize_list(
@@ -345,91 +447,73 @@ def _get_windows_status_data():
     # Voltage
     # ---------------------------------------------------------
 
-    voltage = item.get(
-        "Voltage"
+    voltage = _safe_float(
+        item.get(
+            "Voltage"
+        )
     )
 
-    if voltage is not None:
-        try:
-            details[
-                "voltage_mv"
-            ] = round(
-                float(voltage),
-                2,
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            pass
+    if (
+        voltage is not None
+        and voltage > 0
+    ):
+        details[
+            "voltage_mv"
+        ] = round(
+            voltage,
+            2,
+        )
 
     # ---------------------------------------------------------
-    # Current capacity
+    # Remaining capacity
     # ---------------------------------------------------------
 
-    remaining_capacity = item.get(
-        "RemainingCapacity"
+    remaining_capacity = _safe_float(
+        item.get(
+            "RemainingCapacity"
+        )
     )
 
-    if remaining_capacity is not None:
-        try:
-            details[
-                "capacity_wh"
-            ] = round(
-                float(
-                    remaining_capacity
-                ) / 1000,
-                3,
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            pass
+    if (
+        remaining_capacity is not None
+        and remaining_capacity >= 0
+    ):
+        details[
+            "capacity_wh"
+        ] = round(
+            remaining_capacity / 1000,
+            3,
+        )
 
     # ---------------------------------------------------------
-    # Charge/discharge power
-    # ---------------------------------------------------------
-    #
-    # Windows exposes both ChargeRate and DischargeRate.
-    # We select whichever one is actually non-zero.
-    #
-    # This avoids reporting 0 W while the machine is
-    # visibly discharging.
+    # Charge/discharge rate
     # ---------------------------------------------------------
 
-    charge_rate = item.get(
-        "ChargeRate"
+    charge_rate = _safe_float(
+        item.get(
+            "ChargeRate"
+        )
     )
 
-    discharge_rate = item.get(
-        "DischargeRate"
+    discharge_rate = _safe_float(
+        item.get(
+            "DischargeRate"
+        )
     )
 
     power_mw = None
 
-    try:
-        if (
-            charge_rate is not None
-            and float(charge_rate) > 0
-        ):
-            power_mw = float(
-                charge_rate
-            )
-
-        elif (
-            discharge_rate is not None
-            and float(discharge_rate) > 0
-        ):
-            power_mw = -float(
-                discharge_rate
-            )
-
-    except (
-        TypeError,
-        ValueError,
+    if (
+        charge_rate is not None
+        and charge_rate > 0
     ):
-        power_mw = None
+        power_mw = charge_rate
+
+    elif (
+        discharge_rate is not None
+        and discharge_rate > 0
+    ):
+        power_mw = -discharge_rate
 
     if power_mw is not None:
         details[
@@ -466,13 +550,403 @@ def _get_windows_status_data():
             2,
         )
 
+    details[
+        "sources"
+    ].append(
+        "Windows BatteryStatus"
+    )
+
     return details
+
+
+def _parse_battery_report_capacity(value):
+    """
+    Convert a battery-report capacity string to Wh.
+
+    Examples:
+    '48,670 mWh' -> 48.67
+    '48,670mWh'  -> 48.67
+    """
+
+    if value is None:
+        return None
+
+    value = unescape(
+        str(value)
+    )
+
+    match = re.search(
+        r"([\d,.\s]+)\s*mWh",
+        value,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    raw = (
+        match.group(1)
+        .replace(",", "")
+        .replace(" ", "")
+    )
+
+    try:
+        return round(
+            float(raw) / 1000,
+            3,
+        )
+
+    except ValueError:
+        return None
+
+
+def _parse_battery_report_cycle_count(value):
+    """
+    Convert a battery-report cycle-count value to an integer.
+    """
+
+    if value is None:
+        return None
+
+    value = unescape(
+        str(value)
+    ).strip()
+
+    match = re.search(
+        r"(\d+)",
+        value,
+    )
+
+    if not match:
+        return None
+
+    try:
+        cycle_count = int(
+            match.group(1)
+        )
+
+        if cycle_count <= 0:
+            return None
+
+        return cycle_count
+
+    except ValueError:
+        return None
+
+
+def _extract_table_rows(html):
+    """
+    Extract simple table rows from Windows battery-report HTML.
+    """
+
+    rows = []
+
+    for row in re.findall(
+        r"<tr[^>]*>(.*?)</tr>",
+        html,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        cells = re.findall(
+            r"<t[dh][^>]*>(.*?)</t[dh]>",
+            row,
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        cleaned = []
+
+        for cell in cells:
+            cell = re.sub(
+                r"<[^>]+>",
+                " ",
+                cell,
+            )
+
+            cell = unescape(
+                cell
+            )
+
+            cell = re.sub(
+                r"\s+",
+                " ",
+                cell,
+            ).strip()
+
+            cleaned.append(cell)
+
+        if cleaned:
+            rows.append(cleaned)
+
+    return rows
+
+
+def _get_windows_battery_report():
+    """
+    Use Windows powercfg /batteryreport as a fallback
+    telemetry source.
+
+    This is particularly useful when WMI does not expose:
+    - Design capacity
+    - Full charge capacity
+    - Cycle count
+    """
+
+    if platform.system() != "Windows":
+        return _empty_details()
+
+    details = _empty_details()
+
+    temp_directory = tempfile.gettempdir()
+
+    report_path = os.path.join(
+        temp_directory,
+        "forza_battery_report.html",
+    )
+
+    try:
+        # Remove stale report first.
+        try:
+            if os.path.exists(
+                report_path
+            ):
+                os.remove(
+                    report_path
+                )
+        except Exception:
+            pass
+
+        result = subprocess.run(
+            [
+                "powercfg",
+                "/batteryreport",
+                "/output",
+                report_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            return details
+
+        if not os.path.exists(
+            report_path
+        ):
+            return details
+
+        with open(
+            report_path,
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+        ) as file:
+            html = file.read()
+
+        rows = _extract_table_rows(
+            html
+        )
+
+        # -----------------------------------------------------
+        # Parse battery information
+        # -----------------------------------------------------
+
+        for row in rows:
+            if len(row) < 2:
+                continue
+
+            label = row[0].lower()
+
+            value = row[1]
+
+            # Design capacity
+            if (
+                "design capacity"
+                in label
+            ):
+                capacity = (
+                    _parse_battery_report_capacity(
+                        value
+                    )
+                )
+
+                if (
+                    capacity is not None
+                    and details[
+                        "design_capacity_wh"
+                    ] is None
+                ):
+                    details[
+                        "design_capacity_wh"
+                    ] = capacity
+
+            # Full charge capacity
+            elif (
+                "full charge capacity"
+                in label
+            ):
+                capacity = (
+                    _parse_battery_report_capacity(
+                        value
+                    )
+                )
+
+                if (
+                    capacity is not None
+                    and details[
+                        "full_charge_capacity_wh"
+                    ] is None
+                ):
+                    details[
+                        "full_charge_capacity_wh"
+                    ] = capacity
+
+            # Cycle count
+            elif (
+                "cycle count"
+                in label
+            ):
+                cycle_count = (
+                    _parse_battery_report_cycle_count(
+                        value
+                    )
+                )
+
+                if (
+                    cycle_count is not None
+                    and details[
+                        "cycle_count"
+                    ] is None
+                ):
+                    details[
+                        "cycle_count"
+                    ] = cycle_count
+
+        # -----------------------------------------------------
+        # Battery report may contain the information in
+        # multiple battery sections. Scan the complete
+        # document as a fallback.
+        # -----------------------------------------------------
+
+        if (
+            details[
+                "design_capacity_wh"
+            ]
+            is None
+        ):
+            matches = re.findall(
+                r"Design Capacity.*?"
+                r"([\d,.\s]+)\s*mWh",
+                html,
+                re.IGNORECASE | re.DOTALL,
+            )
+
+            for match in matches:
+                capacity = (
+                    _parse_battery_report_capacity(
+                        match
+                    )
+                )
+
+                if capacity is not None:
+                    details[
+                        "design_capacity_wh"
+                    ] = capacity
+                    break
+
+        if (
+            details[
+                "full_charge_capacity_wh"
+            ]
+            is None
+        ):
+            matches = re.findall(
+                r"Full Charge Capacity.*?"
+                r"([\d,.\s]+)\s*mWh",
+                html,
+                re.IGNORECASE | re.DOTALL,
+            )
+
+            for match in matches:
+                capacity = (
+                    _parse_battery_report_capacity(
+                        match
+                    )
+                )
+
+                if capacity is not None:
+                    details[
+                        "full_charge_capacity_wh"
+                    ] = capacity
+                    break
+
+        if (
+            details[
+                "cycle_count"
+            ]
+            is None
+        ):
+            matches = re.findall(
+                r"Cycle Count.*?"
+                r"(\d+)",
+                html,
+                re.IGNORECASE | re.DOTALL,
+            )
+
+            for match in matches:
+                cycle_count = (
+                    _parse_battery_report_cycle_count(
+                        match
+                    )
+                )
+
+                if cycle_count is not None:
+                    details[
+                        "cycle_count"
+                    ] = cycle_count
+                    break
+
+        if (
+            details[
+                "design_capacity_wh"
+            ]
+            is not None
+            or details[
+                "full_charge_capacity_wh"
+            ]
+            is not None
+            or details[
+                "cycle_count"
+            ]
+            is not None
+        ):
+            details[
+                "sources"
+            ].append(
+                "Windows Battery Report"
+            )
+
+        return details
+
+    except Exception:
+        return details
+
+    finally:
+        try:
+            if os.path.exists(
+                report_path
+            ):
+                os.remove(
+                    report_path
+                )
+        except Exception:
+            pass
 
 
 def _get_windows_temperature():
     """
-    Get battery temperature only when Windows explicitly
-    identifies an ACPI thermal zone as battery-related.
+    Get battery temperature when Windows exposes a thermal
+    zone explicitly associated with the battery.
     """
 
     temperatures = []
@@ -502,34 +976,34 @@ def _get_windows_temperature():
             or ""
         ).lower()
 
-        if "battery" not in instance_name:
-            continue
-
-        temperature = item.get(
-            "CurrentTemperature"
-        )
-
-        try:
-            temperature_c = (
-                float(temperature)
-                / 10
-                - 273.15
-            )
-
-            if (
-                -40
-                <= temperature_c
-                <= 100
-            ):
-                temperatures.append(
-                    temperature_c
-                )
-
-        except (
-            TypeError,
-            ValueError,
+        if (
+            "battery" not in instance_name
+            and "bat" not in instance_name
         ):
             continue
+
+        temperature = _safe_float(
+            item.get(
+                "CurrentTemperature"
+            )
+        )
+
+        if temperature is None:
+            continue
+
+        temperature_c = (
+            temperature / 10
+            - 273.15
+        )
+
+        if (
+            -40
+            <= temperature_c
+            <= 100
+        ):
+            temperatures.append(
+                temperature_c
+            )
 
     if not temperatures:
         return None
@@ -542,7 +1016,10 @@ def _get_windows_temperature():
 
 def _get_windows_details():
     """
-    Complete Windows battery hardware collector.
+    Complete Windows battery collector.
+
+    Uses WMI/ACPI first and Windows Battery Report as
+    a fallback for static battery health information.
     """
 
     details = _empty_details()
@@ -550,8 +1027,76 @@ def _get_windows_details():
     static = _get_windows_static_data()
     status = _get_windows_status_data()
 
-    details.update(static)
-    details.update(status)
+    # ---------------------------------------------------------
+    # WMI static data
+    # ---------------------------------------------------------
+
+    for key in (
+        "manufacturer",
+        "model",
+        "design_capacity_wh",
+        "full_charge_capacity_wh",
+        "cycle_count",
+    ):
+        if static.get(key) is not None:
+            details[key] = static[key]
+
+    # ---------------------------------------------------------
+    # Live status
+    # ---------------------------------------------------------
+
+    for key in (
+        "capacity_wh",
+        "voltage_mv",
+        "current_ma",
+        "power_w",
+    ):
+        if status.get(key) is not None:
+            details[key] = status[key]
+
+    # ---------------------------------------------------------
+    # Battery Report fallback
+    # ---------------------------------------------------------
+
+    report = _get_windows_battery_report()
+
+    for key in (
+        "design_capacity_wh",
+        "full_charge_capacity_wh",
+        "cycle_count",
+    ):
+        if (
+            details.get(key) is None
+            and report.get(key) is not None
+        ):
+            details[key] = report[key]
+
+    # ---------------------------------------------------------
+    # Sources
+    # ---------------------------------------------------------
+
+    details[
+        "sources"
+    ] = list(
+        dict.fromkeys(
+            static.get(
+                "sources",
+                []
+            )
+            + status.get(
+                "sources",
+                []
+            )
+            + report.get(
+                "sources",
+                []
+            )
+        )
+    )
+
+    # ---------------------------------------------------------
+    # Temperature
+    # ---------------------------------------------------------
 
     details[
         "temperature_c"
@@ -579,7 +1124,7 @@ def _get_macos_details():
             ],
             capture_output=True,
             text=True,
-            timeout=8,
+            timeout=10,
             check=False,
         )
 
@@ -605,11 +1150,18 @@ def _get_macos_details():
             {},
         )
 
-        details[
-            "cycle_count"
-        ] = health.get(
-            "cycle_count"
+        cycle_count = (
+            health.get(
+                "cycle_count"
+            )
         )
+
+        if cycle_count is not None:
+            details[
+                "cycle_count"
+            ] = _safe_int(
+                cycle_count
+            )
 
         details[
             "manufacturer"
@@ -629,20 +1181,32 @@ def _get_macos_details():
 
         details[
             "design_capacity_wh"
-        ] = info.get(
-            "sppower_battery_design_capacity"
+        ] = _safe_float(
+            info.get(
+                "sppower_battery_design_capacity"
+            )
         )
 
         details[
             "full_charge_capacity_wh"
-        ] = info.get(
-            "sppower_battery_capacity"
+        ] = _safe_float(
+            info.get(
+                "sppower_battery_capacity"
+            )
         )
 
         details[
             "voltage_mv"
-        ] = info.get(
-            "sppower_battery_voltage"
+        ] = _safe_float(
+            info.get(
+                "sppower_battery_voltage"
+            )
+        )
+
+        details[
+            "sources"
+        ].append(
+            "macOS system_profiler"
         )
 
     except Exception:
@@ -705,62 +1269,82 @@ def _get_linux_details():
         )
 
         if cycle:
-            try:
+            cycle_value = _safe_int(
+                cycle
+            )
+
+            if (
+                cycle_value is not None
+                and cycle_value > 0
+            ):
                 details[
                     "cycle_count"
-                ] = int(cycle)
-            except ValueError:
-                pass
+                ] = cycle_value
 
         voltage = read_file(
             "voltage_now"
         )
 
         if voltage:
-            try:
+            voltage_value = _safe_float(
+                voltage
+            )
+
+            if (
+                voltage_value is not None
+                and voltage_value > 0
+            ):
                 details[
                     "voltage_mv"
                 ] = round(
-                    int(voltage) / 1000,
+                    voltage_value / 1000,
                     2,
                 )
-            except ValueError:
-                pass
 
         current = read_file(
             "current_now"
         )
 
         if current:
-            try:
+            current_value = _safe_float(
+                current
+            )
+
+            if current_value is not None:
                 details[
                     "current_ma"
                 ] = round(
-                    int(current) / 1000,
+                    current_value / 1000,
                     2,
                 )
-            except ValueError:
-                pass
 
         if (
-            details["current_ma"]
-            is not None
-            and details["voltage_mv"]
-            is not None
+            details[
+                "current_ma"
+            ] is not None
+            and details[
+                "voltage_mv"
+            ] is not None
         ):
             details[
                 "power_w"
             ] = round(
                 (
-                    details["current_ma"]
-                    / 1000
+                    details[
+                        "current_ma"
+                    ] / 1000
                 )
                 * (
-                    details["voltage_mv"]
-                    / 1000
+                    details[
+                        "voltage_mv"
+                    ] / 1000
                 ),
                 3,
             )
+
+        # -----------------------------------------------------
+        # Energy values
+        # -----------------------------------------------------
 
         energy_now = read_file(
             "energy_now"
@@ -775,42 +1359,58 @@ def _get_linux_details():
         )
 
         if energy_now:
-            details[
-                "capacity_wh"
-            ] = round(
-                int(energy_now)
-                / 1_000_000,
-                3,
+            value = _safe_float(
+                energy_now
             )
+
+            if value is not None:
+                details[
+                    "capacity_wh"
+                ] = round(
+                    value / 1_000_000,
+                    3,
+                )
 
         if energy_full:
-            details[
-                "full_charge_capacity_wh"
-            ] = round(
-                int(energy_full)
-                / 1_000_000,
-                3,
+            value = _safe_float(
+                energy_full
             )
 
+            if value is not None:
+                details[
+                    "full_charge_capacity_wh"
+                ] = round(
+                    value / 1_000_000,
+                    3,
+                )
+
         if energy_design:
-            details[
-                "design_capacity_wh"
-            ] = round(
-                int(energy_design)
-                / 1_000_000,
-                3,
+            value = _safe_float(
+                energy_design
             )
+
+            if value is not None:
+                details[
+                    "design_capacity_wh"
+                ] = round(
+                    value / 1_000_000,
+                    3,
+                )
+
+        # -----------------------------------------------------
+        # Battery temperature
+        # -----------------------------------------------------
 
         temperature = read_file(
             "temp"
         )
 
         if temperature:
-            try:
-                value = float(
-                    temperature
-                )
+            value = _safe_float(
+                temperature
+            )
 
+            if value is not None:
                 if abs(value) > 200:
                     value /= 10
 
@@ -826,8 +1426,11 @@ def _get_linux_details():
                         1,
                     )
 
-            except ValueError:
-                pass
+        details[
+            "sources"
+        ].append(
+            "Linux power_supply sysfs"
+        )
 
     except Exception:
         pass
@@ -847,6 +1450,7 @@ def _calculate_health(
         design_capacity is None
         or full_charge_capacity is None
         or design_capacity <= 0
+        or full_charge_capacity <= 0
     ):
         return None
 
@@ -868,10 +1472,26 @@ def _calculate_health(
 
 
 def _format_time(seconds):
+    """
+    Convert seconds to a human-readable duration.
+    """
+
     if seconds is None:
         return None
 
+    try:
+        seconds = int(seconds)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+    if seconds < 0:
+        return None
+
     hours = seconds // 3600
+
     minutes = (
         seconds % 3600
     ) // 60
@@ -884,6 +1504,9 @@ def _format_time(seconds):
 def get_battery():
     """
     Collect complete battery information.
+
+    The collector preserves the existing output schema while
+    adding more reliable Windows telemetry and fallbacks.
     """
 
     battery = _get_basic_battery()
@@ -919,6 +1542,8 @@ def get_battery():
             "power_w": None,
 
             "temperature_c": None,
+
+            "sources": [],
         }
 
     system = platform.system()
@@ -952,7 +1577,7 @@ def get_battery():
         "component": "Battery",
         "available": True,
 
-        # Existing objectives
+        # Existing battery state
         "percentage": battery[
             "percentage"
         ],
@@ -975,11 +1600,11 @@ def get_battery():
             )
         ),
 
-        # Analytics-layer estimates
+        # Reserved analytics fields
         "estimated_seconds_remaining": None,
         "estimated_time_remaining": None,
 
-        # Hardware
+        # Hardware identity
         "manufacturer": details[
             "manufacturer"
         ],
@@ -987,7 +1612,7 @@ def get_battery():
             "model"
         ],
 
-        # Capacity
+        # Battery capacity
         "capacity_wh": details[
             "capacity_wh"
         ],
@@ -998,13 +1623,13 @@ def get_battery():
             "full_charge_capacity_wh"
         ],
 
-        # Health
+        # Battery health
         "health_percent": health,
         "cycle_count": details[
             "cycle_count"
         ],
 
-        # Electrical
+        # Electrical telemetry
         "voltage_mv": details[
             "voltage_mv"
         ],
@@ -1015,8 +1640,13 @@ def get_battery():
             "power_w"
         ],
 
-        # Thermal
+        # Thermal telemetry
         "temperature_c": details[
             "temperature_c"
+        ],
+
+        # Telemetry provenance
+        "sources": details[
+            "sources"
         ],
     }
