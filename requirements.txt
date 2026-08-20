@@ -1,11 +1,36 @@
--r requirements/hardware.txt
--r requirements/ai.txt
--r requirements/development.txt
+# ============================================================
+# Forza AI - Runtime Dependencies
+# ============================================================
 
-rich
-python-dotenv
-sqlalchemy
-toml
+# -------------------------
+# Core / Cross-platform
+# -------------------------
+psutil
+platformdirs
+
+# -------------------------
+# AI / LLM
+# -------------------------
+openai
+ollama
 requests
-httpx
-rapidfuzz
+python-dotenv
+huggingface-hub
+
+# -------------------------
+# Windows
+# -------------------------
+pycaw; sys_platform == "win32"
+comtypes; sys_platform == "win32"
+pywin32; sys_platform == "win32"
+
+# -------------------------
+# Linux
+# -------------------------
+# Linux-specific Python dependencies go here.
+# -------------------------
+
+# -------------------------
+# macOS
+# -------------------------
+# macOS-specific Python dependencies go here.

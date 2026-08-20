@@ -1,8 +1,0 @@
-psutil
-pycaw
-comtypes
-platformdirs
-pywin32
-screeninfo
-sounddevice
-opencv-python
