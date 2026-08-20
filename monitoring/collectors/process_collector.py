@@ -1,5 +1,8 @@
 import json
+import os
 import platform
+import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -15,8 +18,35 @@ def _safe_call(function, default=None):
         psutil.AccessDenied,
         psutil.ZombieProcess,
         OSError,
+        ValueError,
     ):
         return default
+
+
+def _run_command(command, timeout=3):
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            return None
+
+        output = result.stdout.strip()
+
+        return output if output else None
+
+    except (
+        subprocess.TimeoutExpired,
+        FileNotFoundError,
+        OSError,
+        ValueError,
+    ):
+        return None
 
 
 def _format_uptime(seconds):
@@ -49,7 +79,7 @@ def _format_uptime(seconds):
     return f"{seconds}s"
 
 
-def _empty_network():
+def _empty_network(source=None):
     return {
         "available": False,
         "bytes_sent": None,
@@ -59,239 +89,267 @@ def _empty_network():
         "byte_counters_available": False,
         "connection_count": 0,
         "connections": [],
-        "source": None,
+        "source": source,
+    }
+
+
+def _normalise_connection(connection):
+    local_address = getattr(
+        connection,
+        "laddr",
+        None,
+    )
+
+    remote_address = getattr(
+        connection,
+        "raddr",
+        None,
+    )
+
+    if hasattr(local_address, "ip"):
+        local_ip = local_address.ip
+        local_port = local_address.port
+    elif isinstance(local_address, tuple):
+        local_ip = (
+            local_address[0]
+            if local_address
+            else None
+        )
+        local_port = (
+            local_address[1]
+            if len(local_address) > 1
+            else None
+        )
+    else:
+        local_ip = None
+        local_port = None
+
+    if hasattr(remote_address, "ip"):
+        remote_ip = remote_address.ip
+        remote_port = remote_address.port
+    elif isinstance(remote_address, tuple):
+        remote_ip = (
+            remote_address[0]
+            if remote_address
+            else None
+        )
+        remote_port = (
+            remote_address[1]
+            if len(remote_address) > 1
+            else None
+        )
+    else:
+        remote_ip = None
+        remote_port = None
+
+    return {
+        "local_address": local_ip,
+        "local_port": local_port,
+        "remote_address": remote_ip,
+        "remote_port": remote_port,
+        "state": getattr(
+            connection,
+            "status",
+            None,
+        ),
+        "family": str(
+            getattr(
+                connection,
+                "family",
+                "",
+            )
+        ),
+        "type": str(
+            getattr(
+                connection,
+                "type",
+                "",
+            )
+        ),
     }
 
 
 def _collect_network_connections():
+    """
+    Cross-platform process-to-network connection mapping.
+
+    psutil.net_connections() is used on Windows, Linux,
+    macOS, and other platforms supported by psutil.
+
+    The owning PID is not guaranteed to be available on
+    every operating system or for every connection. Such
+    connections are skipped rather than assigned incorrectly.
+    """
+
     grouped = {}
 
-    if platform.system() != "Windows":
-        return grouped
-
     try:
-        script = (
-            "$ErrorActionPreference='SilentlyContinue'; "
-            "Get-NetTCPConnection | "
-            "Select-Object OwningProcess,LocalAddress,LocalPort,"
-            "RemoteAddress,RemotePort,State | "
-            "ConvertTo-Json -Compress"
+        connections = psutil.net_connections(
+            kind="inet"
+        )
+    except (
+        psutil.AccessDenied,
+        OSError,
+        NotImplementedError,
+    ):
+        connections = []
+
+    for connection in connections:
+        pid = getattr(
+            connection,
+            "pid",
+            None,
         )
 
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        if pid is None:
+            continue
 
-        if result.returncode != 0:
-            return grouped
+        try:
+            pid = int(pid)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
 
-        output = result.stdout.strip()
-
-        if not output:
-            return grouped
-
-        data = json.loads(output)
-
-        if isinstance(data, dict):
-            data = [data]
-
-        for item in data:
-            try:
-                pid = int(
-                    item.get(
-                        "OwningProcess"
-                    )
-                )
-            except (
-                TypeError,
-                ValueError,
-            ):
-                continue
-
-            connection = {
-                "local_address": item.get(
-                    "LocalAddress"
-                ),
-                "local_port": item.get(
-                    "LocalPort"
-                ),
-                "remote_address": item.get(
-                    "RemoteAddress"
-                ),
-                "remote_port": item.get(
-                    "RemotePort"
-                ),
-                "state": item.get(
-                    "State"
-                ),
+        if pid not in grouped:
+            grouped[pid] = {
+                "available": True,
+                "bytes_sent": None,
+                "bytes_received": None,
+                "bytes_sent_per_sec": None,
+                "bytes_received_per_sec": None,
+                "byte_counters_available": False,
+                "connection_count": 0,
+                "connections": [],
+                "source": "psutil network connections",
             }
 
-            if pid not in grouped:
-                grouped[pid] = {
-                    "available": True,
-                    "bytes_sent": None,
-                    "bytes_received": None,
-                    "bytes_sent_per_sec": None,
-                    "bytes_received_per_sec": None,
-                    "byte_counters_available": False,
-                    "connection_count": 0,
-                    "connections": [],
-                    "source": (
-                        "Windows TCP connections"
-                    ),
-                }
+        grouped[pid]["connections"].append(
+            _normalise_connection(
+                connection
+            )
+        )
 
-            grouped[pid][
-                "connections"
-            ].append(connection)
-
-            grouped[pid][
-                "connection_count"
-            ] += 1
-
-    except (
-        subprocess.TimeoutExpired,
-        json.JSONDecodeError,
-        OSError,
-        ValueError,
-    ):
-        return {}
-
-    except Exception:
-        return {}
+        grouped[pid]["connection_count"] += 1
 
     return grouped
 
 
-def _collect_network_counters():
+def _parse_nethogs_output(output):
     """
-    Attempt to collect Windows per-process network
-    byte counters.
+    Parse text-mode nethogs output.
 
-    Windows exposes network counters through several
-    performance-counter providers. Availability varies
-    between Windows versions and processes.
+    nethogs is optional on Linux. Different distributions
+    can expose slightly different formatting, so parsing is
+    deliberately defensive.
 
-    Returns:
-        {
-            pid: {
-                bytes_sent,
-                bytes_received,
-                bytes_sent_per_sec,
-                bytes_received_per_sec,
-                byte_counters_available,
-                source
-            }
-        }
+    The resulting rates are bytes/sec.
     """
 
     grouped = {}
 
-    if platform.system() != "Windows":
+    if not output:
         return grouped
 
-    try:
-        script = r"""
-$ErrorActionPreference = 'SilentlyContinue'
+    for line in output.splitlines():
+        line = line.strip()
 
-$counters = @(
-    '\Process(*)\IO Read Bytes/sec',
-    '\Process(*)\IO Write Bytes/sec'
-)
+        if not line:
+            continue
 
-$result = Get-Counter -Counter $counters -ErrorAction SilentlyContinue
+        lowered = line.lower()
 
-if ($null -eq $result) {
-    exit 1
-}
+        if (
+            lowered.startswith("waiting")
+            or lowered.startswith("refreshing")
+            or lowered.startswith("pid")
+            or lowered.startswith("net hogs")
+        ):
+            continue
 
-$result.CounterSamples |
-    Select-Object InstanceName,Path,CookedValue |
-    ConvertTo-Json -Compress
-"""
-
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
+        parts = re.split(
+            r"\s+",
+            line,
         )
 
-        if result.returncode != 0:
-            return grouped
+        if len(parts) < 3:
+            continue
 
-        output = result.stdout.strip()
+        pid = None
 
-        if not output:
-            return grouped
+        for part in parts:
+            match = re.search(
+                r"/(\d+)/",
+                part,
+            )
 
-        data = json.loads(output)
+            if match:
+                try:
+                    pid = int(
+                        match.group(1)
+                    )
+                except ValueError:
+                    pid = None
 
-        if isinstance(data, dict):
-            data = [data]
+                break
 
-        for item in data:
-            instance_name = str(
-                item.get(
-                    "InstanceName",
+            if "/" in part:
+                match = re.search(
+                    r"(\d+)$",
+                    part,
+                )
+
+                if match:
+                    try:
+                        pid = int(
+                            match.group(1)
+                        )
+                    except ValueError:
+                        pid = None
+
+                    break
+
+        if pid is None:
+            continue
+
+        rate_values = []
+
+        for part in parts:
+            cleaned = (
+                part.replace(
+                    "KB/s",
                     "",
                 )
-            )
-
-            if not instance_name:
-                continue
-
-            pid_marker = (
-                instance_name
-                .lower()
-                .split("#")[0]
-            )
-
-            # Performance-counter process instances
-            # use names such as:
-            #
-            # chrome
-            # chrome#1
-            #
-            # The process ID itself isn't directly
-            # encoded in these counters, so we only
-            # use the counters when Windows exposes
-            # an unambiguous process instance.
-            #
-            # We therefore do not assign ambiguous
-            # counters to PIDs.
-
-            path = str(
-                item.get(
-                    "Path",
+                .replace(
+                    "kB/s",
                     "",
                 )
-            )
-
-            cooked_value = item.get(
-                "CookedValue"
+                .replace(
+                    "kb/s",
+                    "",
+                )
+                .replace(
+                    "MB/s",
+                    "",
+                )
+                .replace(
+                    "MB",
+                    "",
+                )
+                .replace(
+                    "KB",
+                    "",
+                )
+                .replace(
+                    "kB",
+                    "",
+                )
             )
 
             try:
                 value = float(
-                    cooked_value
+                    cleaned
                 )
             except (
                 TypeError,
@@ -299,201 +357,426 @@ $result.CounterSamples |
             ):
                 continue
 
-            lower_path = path.lower()
-
-            if "io read bytes/sec" in lower_path:
-                counter_type = "read"
-
-            elif "io write bytes/sec" in lower_path:
-                counter_type = "write"
-
-            else:
-                continue
-
-            key = (
-                pid_marker,
-                counter_type,
+            rate_values.append(
+                value
             )
 
-            if key not in grouped:
-                grouped[key] = {
-                    "instance_name": (
-                        instance_name
-                    ),
-                    "read_per_sec": None,
-                    "write_per_sec": None,
-                }
+        if len(rate_values) < 2:
+            continue
 
-            if counter_type == "read":
-                grouped[key][
-                    "read_per_sec"
-                ] = max(
-                    0.0,
-                    value,
-                )
+        sent = rate_values[-2]
+        received = rate_values[-1]
 
-            else:
-                grouped[key][
-                    "write_per_sec"
-                ] = max(
-                    0.0,
-                    value,
-                )
+        # nethogs normally reports KB/s.
+        sent_per_sec = max(
+            0.0,
+            sent,
+        ) * 1024
 
-    except (
-        subprocess.TimeoutExpired,
-        json.JSONDecodeError,
-        OSError,
-        ValueError,
-    ):
-        return {}
+        received_per_sec = max(
+            0.0,
+            received,
+        ) * 1024
 
-    except Exception:
-        return {}
+        grouped[pid] = {
+            "bytes_sent": None,
+            "bytes_received": None,
+            "bytes_sent_per_sec": round(
+                sent_per_sec,
+                2,
+            ),
+            "bytes_received_per_sec": round(
+                received_per_sec,
+                2,
+            ),
+            "byte_counters_available": True,
+            "source": "Linux nethogs",
+        }
 
     return grouped
 
 
-def _collect_gpu_data():
+def _collect_linux_network_counters():
+    """
+    Optional Linux process network telemetry.
+
+    Uses nethogs when installed.
+
+    If nethogs is unavailable, the caller still receives
+    cross-platform psutil connection information.
+    """
+
+    if platform.system() != "Linux":
+        return {}
+
+    nethogs = shutil.which(
+        "nethogs"
+    )
+
+    if not nethogs:
+        return {}
+
+    output = _run_command(
+        [
+            nethogs,
+            "-t",
+            "-c",
+            "1",
+        ],
+        timeout=5,
+    )
+
+    if not output:
+        return {}
+
+    return _parse_nethogs_output(
+        output
+    )
+
+
+def _parse_nettop_output(output):
+    """
+    Best-effort parser for macOS nettop batch output.
+
+    nettop output varies between macOS versions. This parser
+    therefore only accepts rows where a PID and two usable
+    numeric traffic values can be identified.
+
+    Rates are returned as bytes/sec when detected.
+    """
+
+    grouped = {}
+
+    if not output:
+        return grouped
+
+    for line in output.splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        lowered = line.lower()
+
+        if (
+            lowered.startswith("time,")
+            or lowered.startswith("interface")
+            or lowered.startswith("process")
+        ):
+            continue
+
+        parts = [
+            part.strip()
+            for part in line.split(",")
+        ]
+
+        if len(parts) < 3:
+            continue
+
+        pid = None
+
+        # nettop normally contains a PID column.
+        for part in parts:
+            try:
+                candidate = int(
+                    part
+                )
+
+                if candidate > 0:
+                    pid = candidate
+                    break
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        if pid is None:
+            continue
+
+        numeric_values = []
+
+        for part in parts:
+            cleaned = (
+                part.replace(
+                    "B",
+                    "",
+                )
+                .replace(
+                    "/s",
+                    "",
+                )
+                .replace(
+                    "K",
+                    "",
+                )
+                .replace(
+                    "M",
+                    "",
+                )
+                .replace(
+                    "G",
+                    "",
+                )
+            )
+
+            try:
+                numeric_values.append(
+                    float(
+                        cleaned
+                    )
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        if len(numeric_values) < 2:
+            continue
+
+        sent_per_sec = max(
+            0.0,
+            numeric_values[-2],
+        )
+
+        received_per_sec = max(
+            0.0,
+            numeric_values[-1],
+        )
+
+        grouped[pid] = {
+            "bytes_sent": None,
+            "bytes_received": None,
+            "bytes_sent_per_sec": round(
+                sent_per_sec,
+                2,
+            ),
+            "bytes_received_per_sec": round(
+                received_per_sec,
+                2,
+            ),
+            "byte_counters_available": True,
+            "source": "macOS nettop",
+        }
+
+    return grouped
+
+
+def _collect_macos_network_counters():
+    """
+    Optional macOS process network telemetry.
+
+    Uses nettop when available.
+
+    If nettop is unavailable or its output cannot be
+    interpreted safely, psutil connection information
+    remains available.
+    """
+
+    if platform.system() != "Darwin":
+        return {}
+
+    nettop = shutil.which(
+        "nettop"
+    )
+
+    if not nettop:
+        return {}
+
+    output = _run_command(
+        [
+            nettop,
+            "-P",
+            "-L",
+            "1",
+            "-x",
+            "-n",
+        ],
+        timeout=5,
+    )
+
+    if not output:
+        return {}
+
+    return _parse_nettop_output(
+        output
+    )
+
+
+def _collect_network_counters():
+    """
+    Collect optional per-process network traffic rates.
+
+    Platform strategy:
+
+    Linux:
+        nethogs when available.
+
+    macOS:
+        nettop when available.
+
+    Windows:
+        No fabricated network byte counters. Windows
+        process-level network byte accounting is not exposed
+        consistently through psutil.
+
+    All platforms still receive connection information from
+    psutil.net_connections().
+    """
+
+    system = platform.system()
+
+    if system == "Linux":
+        return _collect_linux_network_counters()
+
+    if system == "Darwin":
+        return _collect_macos_network_counters()
+
+    return {}
+
+
+def _collect_windows_gpu():
     grouped = {}
 
     if platform.system() != "Windows":
         return grouped
 
+    powershell = shutil.which(
+        "powershell.exe"
+    )
+
+    if not powershell:
+        return grouped
+
+    script = (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "$counter=Get-Counter "
+        "'\\GPU Engine(*)\\Utilization Percentage' "
+        "-ErrorAction SilentlyContinue; "
+        "if($null -eq $counter){exit 1}; "
+        "$counter.CounterSamples | "
+        "Select-Object InstanceName,CookedValue | "
+        "ConvertTo-Json -Compress"
+    )
+
+    output = _run_command(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        timeout=8,
+    )
+
+    if not output:
+        return grouped
+
     try:
-        script = (
-            "$ErrorActionPreference='SilentlyContinue'; "
-            "$counter=Get-Counter "
-            "'\\GPU Engine(*)\\Utilization Percentage' "
-            "-ErrorAction SilentlyContinue; "
-            "if($null -eq $counter){exit 1}; "
-            "$counter.CounterSamples | "
-            "Select-Object InstanceName,CookedValue | "
-            "ConvertTo-Json -Compress"
+        data = json.loads(
+            output
+        )
+    except (
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        return grouped
+
+    if isinstance(
+        data,
+        dict,
+    ):
+        data = [data]
+
+    for item in data:
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        instance_name = str(
+            item.get(
+                "InstanceName",
+                "",
+            )
         )
 
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
+        marker = "pid_"
+
+        marker_index = (
+            instance_name.lower().find(
+                marker
+            )
         )
 
-        if result.returncode != 0:
-            return grouped
+        if marker_index == -1:
+            continue
 
-        output = result.stdout.strip()
+        pid_start = (
+            marker_index
+            + len(marker)
+        )
 
-        if not output:
-            return grouped
+        pid_chars = []
 
-        data = json.loads(output)
+        for character in instance_name[
+            pid_start:
+        ]:
+            if character.isdigit():
+                pid_chars.append(
+                    character
+                )
+            else:
+                break
 
-        if isinstance(data, dict):
-            data = [data]
+        if not pid_chars:
+            continue
 
-        for item in data:
-            instance_name = str(
-                item.get(
-                    "InstanceName",
-                    "",
+        try:
+            pid = int(
+                "".join(
+                    pid_chars
                 )
             )
 
-            if not instance_name:
-                continue
-
-            lower_name = (
-                instance_name.lower()
-            )
-
-            marker = "pid_"
-
-            marker_index = (
-                lower_name.find(
-                    marker
-                )
-            )
-
-            if marker_index == -1:
-                continue
-
-            pid_start = (
-                marker_index
-                + len(marker)
-            )
-
-            pid_chars = []
-
-            for character in lower_name[
-                pid_start:
-            ]:
-                if character.isdigit():
-                    pid_chars.append(
-                        character
-                    )
-                else:
-                    break
-
-            if not pid_chars:
-                continue
-
-            try:
-                pid = int(
-                    "".join(pid_chars)
-                )
-
-                usage = float(
+            usage = max(
+                0.0,
+                float(
                     item.get(
                         "CookedValue",
                         0,
                     )
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-                continue
-
-            if pid not in grouped:
-                grouped[pid] = {
-                    "available": True,
-                    "usage_percent": 0.0,
-                    "engine_count": 0,
-                    "source": (
-                        "Windows GPU Engine"
-                    ),
-                }
-
-            grouped[pid][
-                "usage_percent"
-            ] += max(
-                0.0,
-                usage,
+                ),
             )
 
-            grouped[pid][
-                "engine_count"
-            ] += 1
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
 
-    except (
-        subprocess.TimeoutExpired,
-        json.JSONDecodeError,
-        OSError,
-        ValueError,
-    ):
-        return {}
+        if pid not in grouped:
+            grouped[pid] = {
+                "available": True,
+                "usage_percent": 0.0,
+                "engine_count": 0,
+                "source": (
+                    "Windows GPU Engine"
+                ),
+            }
 
-    except Exception:
-        return {}
+        grouped[pid][
+            "usage_percent"
+        ] += usage
+
+        grouped[pid][
+            "engine_count"
+        ] += 1
 
     for data in grouped.values():
         data[
@@ -509,6 +792,72 @@ def _collect_gpu_data():
         )
 
     return grouped
+
+
+def _collect_linux_gpu():
+    """
+    Linux GPU process utilisation is not exposed through one
+    universal standard interface.
+
+    Keep this backend separate so future GPU providers can be
+    added without making the process collector Linux-only.
+    """
+
+    if platform.system() != "Linux":
+        return {}
+
+    drm_path = Path(
+        "/sys/class/drm"
+    )
+
+    if not drm_path.exists():
+        return {}
+
+    # Detect GPU devices, but do not incorrectly claim that
+    # they provide process-level utilisation.
+    for entry in drm_path.glob(
+        "card*"
+    ):
+        if "-" in entry.name:
+            continue
+
+        device_path = (
+            entry / "device"
+        )
+
+        if device_path.exists():
+            return {}
+
+    return {}
+
+
+def _collect_macos_gpu():
+    """
+    macOS does not provide one universally available,
+    process-level GPU utilisation API.
+
+    Return an empty mapping rather than inventing telemetry.
+    """
+
+    if platform.system() != "Darwin":
+        return {}
+
+    return {}
+
+
+def _collect_gpu_data():
+    system = platform.system()
+
+    if system == "Windows":
+        return _collect_windows_gpu()
+
+    if system == "Linux":
+        return _collect_linux_gpu()
+
+    if system == "Darwin":
+        return _collect_macos_gpu()
+
+    return {}
 
 
 def _get_memory(process):
@@ -531,13 +880,21 @@ def _get_memory(process):
             None,
         )
 
-    return {
-        "memory_percent": round(
+    try:
+        memory_percent = round(
             float(
                 memory_percent or 0
             ),
             2,
-        ),
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        memory_percent = 0.0
+
+    return {
+        "memory_percent": memory_percent,
         "memory_bytes": (
             int(rss_bytes)
             if rss_bytes is not None
@@ -642,9 +999,11 @@ def _get_uptime(process):
 
     try:
         uptime_seconds = max(
-            0,
+            0.0,
             time.time()
-            - float(create_time),
+            - float(
+                create_time
+            ),
         )
 
         return {
@@ -679,7 +1038,9 @@ def _is_real_executable_path(path):
         return False
 
     try:
-        path_string = str(path)
+        path_string = str(
+            path
+        )
 
         if not path_string:
             return False
@@ -725,13 +1086,28 @@ def _get_path(process):
         None,
     )
 
-    real_path = (
+    real_path = None
+
+    if _is_real_executable_path(
         executable
-        if _is_real_executable_path(
-            executable
-        )
-        else None
-    )
+    ):
+        real_path = executable
+    elif executable:
+        try:
+            executable_string = str(
+                executable
+            )
+
+            if os.path.isabs(
+                executable_string
+            ):
+                real_path = executable_string
+        except (
+            TypeError,
+            ValueError,
+            OSError,
+        ):
+            real_path = None
 
     return {
         "available": (
@@ -764,74 +1140,123 @@ def _get_metadata(process):
 def _build_network(
     pid,
     connection_data,
+    counter_data,
 ):
+    network = _empty_network()
+
     connection = connection_data.get(
         pid
     )
 
-    if connection is None:
-        return {
-            "available": True,
-            "bytes_sent": None,
-            "bytes_received": None,
-            "bytes_sent_per_sec": None,
-            "bytes_received_per_sec": None,
-            "byte_counters_available": False,
-            "connection_count": 0,
-            "connections": [],
-            "source": (
-                "Windows TCP connections"
-            ),
-        }
+    if connection is not None:
+        network.update(
+            connection
+        )
 
-    return {
-        "available": connection.get(
-            "available",
-            True,
-        ),
-        "bytes_sent": connection.get(
-            "bytes_sent"
-        ),
-        "bytes_received": connection.get(
-            "bytes_received"
-        ),
-        "bytes_sent_per_sec": connection.get(
-            "bytes_sent_per_sec"
-        ),
-        "bytes_received_per_sec": connection.get(
-            "bytes_received_per_sec"
-        ),
-        "byte_counters_available": connection.get(
+    counter = counter_data.get(
+        pid
+    )
+
+    if counter is not None:
+        # Only overwrite values that the counter provider
+        # actually knows about.
+        for field in (
+            "bytes_sent",
+            "bytes_received",
+            "bytes_sent_per_sec",
+            "bytes_received_per_sec",
+        ):
+            if field in counter:
+                network[field] = (
+                    counter[field]
+                )
+
+        if counter.get(
             "byte_counters_available",
             False,
-        ),
-        "connection_count": connection.get(
-            "connection_count",
-            0,
-        ),
-        "connections": connection.get(
-            "connections",
-            [],
-        ),
-        "source": connection.get(
-            "source",
-            "Windows TCP connections",
-        ),
-    }
+        ):
+            network[
+                "byte_counters_available"
+            ] = True
+
+        counter_source = counter.get(
+            "source"
+        )
+
+        if counter_source:
+            if network.get(
+                "source"
+            ):
+                network[
+                    "source"
+                ] = (
+                    f"{network['source']}; "
+                    f"{counter_source}"
+                )
+            else:
+                network[
+                    "source"
+                ] = counter_source
+
+        network[
+            "available"
+        ] = True
+
+    elif connection is not None:
+        network[
+            "available"
+        ] = True
+
+    return network
 
 
-def _build_gpu(pid, gpu_data):
-    return gpu_data.get(
-        pid,
-        {
+def _build_gpu(
+    pid,
+    gpu_data,
+):
+    if pid in gpu_data:
+        return gpu_data[pid]
+
+    system = platform.system()
+
+    if system == "Windows":
+        return {
             "available": True,
             "usage_percent": 0.0,
             "engine_count": 0,
             "source": (
                 "Windows GPU Engine"
             ),
-        },
-    )
+        }
+
+    if system == "Linux":
+        return {
+            "available": False,
+            "usage_percent": None,
+            "engine_count": 0,
+            "source": (
+                "Linux GPU process "
+                "telemetry unavailable"
+            ),
+        }
+
+    if system == "Darwin":
+        return {
+            "available": False,
+            "usage_percent": None,
+            "engine_count": 0,
+            "source": (
+                "macOS GPU process "
+                "telemetry unavailable"
+            ),
+        }
+
+    return {
+        "available": False,
+        "usage_percent": None,
+        "engine_count": 0,
+        "source": None,
+    }
 
 
 def _build_process(
@@ -899,49 +1324,8 @@ def _build_process(
     network = _build_network(
         pid,
         network_connections,
+        network_counters,
     )
-
-    # Network performance counters use
-    # process-instance names rather than
-    # directly exposing PIDs. Therefore only
-    # unambiguous counters should be attached
-    # to a process.
-    #
-    # We deliberately do not guess here.
-    counter_candidates = [
-        data
-        for key, data
-        in network_counters.items()
-        if data.get(
-            "pid"
-        ) == pid
-    ]
-
-    if len(counter_candidates) == 1:
-        counter = counter_candidates[0]
-
-        network[
-            "bytes_sent_per_sec"
-        ] = counter.get(
-            "bytes_sent_per_sec"
-        )
-
-        network[
-            "bytes_received_per_sec"
-        ] = counter.get(
-            "bytes_received_per_sec"
-        )
-
-        network[
-            "byte_counters_available"
-        ] = True
-
-        network[
-            "source"
-        ] = (
-            "Windows process "
-            "network performance counters"
-        )
 
     gpu = _build_gpu(
         pid,
@@ -950,10 +1334,12 @@ def _build_process(
 
     return {
         "pid": pid,
-        "name": name or "Unknown",
-
-        "cpu_percent": cpu_percent,
-
+        "name": (
+            name or "Unknown"
+        ),
+        "cpu_percent": (
+            cpu_percent
+        ),
         "memory_percent": memory[
             "memory_percent"
         ],
@@ -963,7 +1349,6 @@ def _build_process(
         "memory_mb": memory[
             "memory_mb"
         ],
-
         "path": path[
             "executable"
         ],
@@ -976,12 +1361,10 @@ def _build_process(
         "working_directory": path[
             "working_directory"
         ],
-
         "disk": disk,
         "network": network,
         "gpu": gpu,
         "uptime": uptime,
-
         "username": metadata[
             "username"
         ],
@@ -996,7 +1379,9 @@ def _build_process(
 
 def get_processes(limit=10):
     try:
-        limit = int(limit)
+        limit = int(
+            limit
+        )
     except (
         TypeError,
         ValueError,
@@ -1015,11 +1400,18 @@ def get_processes(limit=10):
     except Exception:
         process_list = []
 
+    active_processes = []
+
     for process in process_list:
         try:
             process.cpu_percent(
                 interval=None
             )
+
+            active_processes.append(
+                process
+            )
+
         except (
             psutil.NoSuchProcess,
             psutil.AccessDenied,
@@ -1027,23 +1419,30 @@ def get_processes(limit=10):
         ):
             continue
 
-    time.sleep(0.1)
+    # Short sampling interval so the collector doesn't
+    # freeze the rest of the monitoring system.
+    time.sleep(
+        0.1
+    )
 
+    # Cross-platform network connections.
     network_connections = (
         _collect_network_connections()
     )
 
+    # Optional platform-specific byte-rate providers.
     network_counters = (
         _collect_network_counters()
     )
 
+    # Optional GPU backend.
     gpu_data = (
         _collect_gpu_data()
     )
 
     processes = []
 
-    for process in process_list:
+    for process in active_processes:
         try:
             process_info = _build_process(
                 process,
