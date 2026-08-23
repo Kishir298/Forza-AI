@@ -28,7 +28,7 @@ soundfile
 # -------------------------
 # Voice Activity Detection
 # -------------------------
-silero-vad-notorch
+silero-vad
 
 # -------------------------
 # Speech-to-Text
@@ -50,7 +50,7 @@ openwakeword
 # -------------------------
 # Text-to-Speech
 # -------------------------
-kokoro; python_version >= "3.10" and python_version < "3.13"
+# TTS backend will be added after Python-version compatibility is finalized.
 
 # -------------------------
 # Windows
@@ -62,9 +62,9 @@ pywin32; sys_platform == "win32"
 # -------------------------
 # Linux
 # -------------------------
-# Linux-specific Python dependencies go here.
+# Linux-specific dependencies will be added only when required.
 
 # -------------------------
 # macOS
 # -------------------------
-# macOS-specific Python dependencies go here.
+# macOS-specific dependencies will be added only when required.
