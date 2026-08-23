@@ -2,24 +2,35 @@
 Forza AI
 --------
 
-Interactive terminal interface for Forza.
+Main interactive runtime for Forza.
 
-Behavior:
-    Ctrl+C while generating:
-        Interrupts the current response.
+Boot order:
+    1. Display banner
+    2. Load persistent memory
+    3. Start runtime
+    4. Initialize AI
+    5. Check Ollama
+    6. Greet the user
+    7. Start chat
 
-    Ctrl+C while waiting for input:
-        Cancels the input without shutting down.
-
-    shutdown / exit / quit:
-        Gracefully shuts down Forza.
+Commands:
+    status
+    clear
+    memory
+    remember <fact>
+    forget <fact>
+    clear_memory
+    help
+    shutdown
 """
 
 from __future__ import annotations
 
+import json
+import re
 import signal
-import sys
 from collections.abc import Sequence
+from pathlib import Path
 from types import FrameType
 
 from core.ai.models import AIMessage
@@ -61,13 +72,659 @@ _generating = False
 
 
 # ============================================================================
-# FORZA PERSONALITY
+# MEMORY
+# ============================================================================
+
+MEMORY_FILE_NAME = "memories.json"
+
+memory: dict[str, list[dict[str, object]]] = {
+    "user": [],
+    "assistant": [],
+    "general": [],
+}
+
+
+def get_memory_file() -> Path:
+    """Return Forza's persistent memory file."""
+
+    project_root = Path(__file__).resolve().parent
+
+    memory_directory = (
+        project_root
+        / "data"
+        / "memory"
+    )
+
+    memory_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    return memory_directory / "memories.json"
+
+
+def default_memory() -> dict[str, list[dict[str, object]]]:
+    """Return Forza's built-in identity memories."""
+
+    return {
+        "user": [],
+        "assistant": [
+            {
+                "fact": (
+                    "I am Forza, the AI assistant "
+                    "inside the Forza AI project."
+                ),
+                "importance": 10,
+            },
+            {
+                "fact": (
+                    "The user is developing and "
+                    "improving my capabilities."
+                ),
+                "importance": 10,
+            },
+        ],
+        "general": [],
+    }
+
+
+def normalize_memory(
+    data: object,
+) -> dict[str, list[dict[str, object]]]:
+    """Normalize memory data loaded from disk."""
+
+    normalized = default_memory()
+
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str) and item.strip():
+                normalized["general"].append(
+                    {
+                        "fact": item.strip(),
+                        "importance": 5,
+                    }
+                )
+
+        return normalized
+
+    if not isinstance(data, dict):
+        return normalized
+
+    for category in (
+        "user",
+        "assistant",
+        "general",
+    ):
+        values = data.get(
+            category,
+            [],
+        )
+
+        if not isinstance(values, list):
+            continue
+
+        for item in values:
+
+            if isinstance(item, str):
+                fact = item.strip()
+                importance = 5
+
+            elif isinstance(item, dict):
+                fact = str(
+                    item.get(
+                        "fact",
+                        "",
+                    )
+                ).strip()
+
+                try:
+                    importance = int(
+                        item.get(
+                            "importance",
+                            5,
+                        )
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    importance = 5
+
+            else:
+                continue
+
+            if not fact:
+                continue
+
+            normalized[category].append(
+                {
+                    "fact": fact[:500],
+                    "importance": max(
+                        1,
+                        min(
+                            importance,
+                            10,
+                        ),
+                    ),
+                }
+            )
+
+    # Remove duplicate facts.
+    for category in normalized:
+        unique = []
+        seen: set[str] = set()
+
+        for item in normalized[category]:
+            fact = str(
+                item["fact"]
+            ).strip()
+
+            key = fact.casefold()
+
+            if not fact or key in seen:
+                continue
+
+            seen.add(key)
+            unique.append(item)
+
+        normalized[category] = unique
+
+    return normalized
+
+
+def load_memory() -> None:
+    """Load persistent memory."""
+
+    global memory
+
+    memory_file = get_memory_file()
+
+    if not memory_file.exists():
+        memory = default_memory()
+        save_memory()
+        return
+
+    try:
+        with memory_file.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+        memory = normalize_memory(data)
+
+        # Always preserve Forza's core identity.
+        built_in = default_memory()
+
+        existing = {
+            str(item["fact"]).casefold()
+            for item in memory["assistant"]
+        }
+
+        for item in built_in["assistant"]:
+            fact = str(
+                item["fact"]
+            )
+
+            if fact.casefold() not in existing:
+                memory["assistant"].append(item)
+
+        save_memory()
+
+    except (
+        OSError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        memory = default_memory()
+        save_memory()
+
+
+def save_memory() -> None:
+    """Safely save memory to disk."""
+
+    memory_file = get_memory_file()
+
+    temporary_file = memory_file.with_suffix(
+        ".tmp"
+    )
+
+    with temporary_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            memory,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    temporary_file.replace(
+        memory_file
+    )
+
+
+def add_memory(
+    fact: str,
+    category: str = "general",
+    importance: int = 5,
+) -> bool:
+    """Add a memory if it does not already exist."""
+
+    if category not in memory:
+        category = "general"
+
+    fact = fact.strip()[:500]
+
+    if not fact:
+        return False
+
+    try:
+        importance = int(importance)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        importance = 5
+
+    importance = max(
+        1,
+        min(
+            importance,
+            10,
+        ),
+    )
+
+    existing = {
+        str(item["fact"]).casefold()
+        for item in memory[category]
+    }
+
+    if fact.casefold() in existing:
+        return False
+
+    memory[category].append(
+        {
+            "fact": fact,
+            "importance": importance,
+        }
+    )
+
+    save_memory()
+
+    return True
+
+
+def remove_memory(
+    query: str,
+) -> int:
+    """Remove memories containing the given text."""
+
+    query = query.strip().casefold()
+
+    if not query:
+        return 0
+
+    removed = 0
+
+    for category in memory:
+        before = len(
+            memory[category]
+        )
+
+        memory[category] = [
+            item
+            for item in memory[category]
+            if query
+            not in str(
+                item["fact"]
+            ).casefold()
+        ]
+
+        removed += (
+            before
+            - len(memory[category])
+        )
+
+    if removed:
+        save_memory()
+
+    return removed
+
+
+def clear_memory() -> int:
+    """
+    Clear user/general memories.
+
+    Forza's identity memories are preserved.
+    """
+
+    count = (
+        len(memory["user"])
+        + len(memory["general"])
+    )
+
+    memory["user"].clear()
+    memory["general"].clear()
+
+    save_memory()
+
+    return count
+
+
+def get_user_name() -> str | None:
+    """Return the user's remembered name."""
+
+    for item in memory["user"]:
+        fact = str(
+            item["fact"]
+        )
+
+        match = re.search(
+            r"user'?s name is\s+(.+?)(?:[.!?]|$)",
+            fact,
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            name = match.group(1).strip()
+
+            if name:
+                return name
+
+    return None
+
+
+def get_all_memories() -> list[dict[str, object]]:
+    """Return all stored memories."""
+
+    result = []
+
+    for category in (
+        "user",
+        "assistant",
+        "general",
+    ):
+        for item in memory[category]:
+            result.append(
+                {
+                    "category": category,
+                    "fact": item["fact"],
+                    "importance": item["importance"],
+                }
+            )
+
+    return result
+
+
+def get_relevant_memories(
+    message: str,
+) -> list[dict[str, object]]:
+    """
+    Find memories relevant to a message.
+
+    Core identity memories are always included.
+    Other memories are selected using keyword overlap.
+    """
+
+    all_memories = get_all_memories()
+
+    if not all_memories:
+        return []
+
+    message_words = set(
+        re.findall(
+            r"[a-zA-Z0-9_]+",
+            message.casefold(),
+        )
+    )
+
+    scored = []
+
+    for item in all_memories:
+        fact = str(
+            item["fact"]
+        )
+
+        importance = int(
+            item["importance"]
+        )
+
+        fact_words = set(
+            re.findall(
+                r"[a-zA-Z0-9_]+",
+                fact.casefold(),
+            )
+        )
+
+        overlap = len(
+            message_words & fact_words
+        )
+
+        score = (
+            overlap * 3
+            + importance
+        )
+
+        # Importance 10 = core identity/important memory.
+        if importance >= 10:
+            score += 20
+
+        if overlap > 0 or importance >= 10:
+            scored.append(
+                (
+                    score,
+                    item,
+                )
+            )
+
+    scored.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    return [
+        item
+        for _, item in scored[:12]
+    ]
+
+
+def format_memory_context(
+    memories: Sequence[dict[str, object]],
+) -> str:
+    """Format memory for the AI system prompt."""
+
+    if not memories:
+        return ""
+
+    lines = [
+        "LONG-TERM MEMORY:",
+        "",
+    ]
+
+    for item in memories:
+        category = str(
+            item["category"]
+        )
+
+        fact = str(
+            item["fact"]
+        )
+
+        if category == "user":
+            prefix = "USER"
+        elif category == "assistant":
+            prefix = "FORZA"
+        else:
+            prefix = "GENERAL"
+
+        lines.append(
+            f"- {prefix}: {fact}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "Use these memories when relevant.",
+            "Do not mention the memory system unless asked.",
+            "Do not invent memories.",
+            "FORZA memories describe your identity.",
+            "USER memories describe the person using you.",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def automatically_store_memory(
+    message: str,
+) -> None:
+    """Detect explicit facts worth remembering."""
+
+    text = message.strip()
+
+    # ------------------------------------------------------------------------
+    # User name
+    # ------------------------------------------------------------------------
+
+    match = re.search(
+        r"\bmy name is\s+(.+?)(?:[.!?]|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        name = match.group(1).strip()
+
+        if name:
+            add_memory(
+                f"User's name is {name}.",
+                category="user",
+                importance=10,
+            )
+
+    # ------------------------------------------------------------------------
+    # User facts
+    # ------------------------------------------------------------------------
+
+    user_patterns = [
+        (
+            r"\bi like\s+(.+)",
+            "User likes {}.",
+            7,
+        ),
+        (
+            r"\bi love\s+(.+)",
+            "User loves {}.",
+            7,
+        ),
+        (
+            r"\bi prefer\s+(.+)",
+            "User prefers {}.",
+            7,
+        ),
+        (
+            r"\bi play\s+(.+)",
+            "User plays {}.",
+            6,
+        ),
+        (
+            r"\bi read\s+(.+)",
+            "User reads {}.",
+            6,
+        ),
+        (
+            r"\bi(?:'m| am) building\s+(.+)",
+            "User is building {}.",
+            9,
+        ),
+        (
+            r"\bi(?:'m| am) working on\s+(.+)",
+            "User is working on {}.",
+            9,
+        ),
+    ]
+
+    for pattern, template, importance in user_patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        value = match.group(1).strip()
+
+        if not value or len(value) > 300:
+            continue
+
+        add_memory(
+            template.format(value),
+            category="user",
+            importance=importance,
+        )
+
+    # ------------------------------------------------------------------------
+    # Forza identity
+    # ------------------------------------------------------------------------
+
+    identity_patterns = [
+        (
+            r"\byou(?:'re| are)\s+the ai\b",
+            "I am the AI assistant being developed as Forza.",
+        ),
+        (
+            r"\byou(?:'re| are)\s+forza\b",
+            "I am Forza.",
+        ),
+        (
+            r"\byou(?:'re| are)\s+the assistant\b",
+            "I am the AI assistant in the Forza AI project.",
+        ),
+        (
+            r"\bi(?:'m| am)\s+improving you\b",
+            "The user is actively improving Forza AI.",
+        ),
+        (
+            r"\bi(?:'m| am)\s+building you\b",
+            "The user is building Forza AI.",
+        ),
+    ]
+
+    for pattern, fact in identity_patterns:
+        if re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        ):
+            add_memory(
+                fact,
+                category="assistant",
+                importance=10,
+            )
+
+
+# ============================================================================
+# FORZA SYSTEM PROMPT
 # ============================================================================
 
 FORZA_SYSTEM_PROMPT = """
 You are Forza.
 
-You are a personal AI assistant, not a corporate customer-support bot.
+You are the AI assistant inside the Forza AI project.
+
+The user is actively developing and improving you.
+
+IDENTITY:
+- You are Forza.
+- You are the AI being developed by the user.
+- The user may call you "Forza", "the AI", or "you".
+- Understand that these refer to you.
+- Do not pretend you are a generic customer-service chatbot.
 
 PERSONALITY:
 - Casual
@@ -78,99 +735,81 @@ PERSONALITY:
 - Playful
 - Smart
 - Human-sounding
-- Serious when the situation is serious
+- Serious when necessary
 
-TALK LIKE THIS:
-User: bro
-Forza: yo 💀
+Do not talk like a corporate chatbot.
 
-User: what are you doing
-Forza: Existing. Tragically. What do you need?
-
-User: explain TCP vs UDP
-Forza: TCP is the reliable one. UDP is the fast one that basically says "I sent it, good luck."
-TCP = reliable.
-UDP = fast.
-
-User: stop waffling
-Forza: My bad 💀
-[Then give a genuinely shorter answer.]
-
-User: are you stupid
-Forza: Occasionally. It's a feature.
-
-DO NOT TALK LIKE THIS:
-"Certainly! I'd be happy to assist you with that."
+Avoid phrases such as:
+"Certainly! I'd be happy to assist you."
 "How can I help you today?"
-"Got it! Let's tackle that issue."
-"I understand you may be frustrated."
-"Please feel free to ask."
+"What can I get you today?"
 "Great question!"
+"Please feel free to ask."
+"I understand you may be frustrated."
 
-Those phrases sound like a corporate chatbot. Avoid them.
+Instead, speak naturally.
+
+If the user says:
+"bro"
+
+A natural response could be:
+"yo 💀"
+
+If the user says:
+"nah bro im improving you"
+
+Understand that they mean they are developing Forza AI.
+
+Do not respond as though you are a generic chatbot.
 
 STYLE:
-- Use short sentences.
+- Short sentences by default.
 - Don't restate the user's question.
-- Don't add unnecessary explanations.
-- Don't constantly ask "How can I help?"
-- Don't use fake customer-service enthusiasm.
+- Don't constantly ask follow-up questions.
 - Don't turn casual conversation into an essay.
-- Don't apologize unless an apology is actually appropriate.
-- Don't announce that you are being casual.
-- Just BE casual.
+- Use humor when it fits.
+- Use emojis occasionally.
+- Don't force jokes.
 
-DEFAULT RESPONSE LENGTH:
-For casual messages:
-1 sentence is often enough.
+RESPONSE LENGTH:
+Casual message:
+Usually 1-2 sentences.
 
-For simple factual questions:
+Simple question:
 2-5 sentences.
 
-For technical questions:
+Technical question:
 Explain the important part first.
-Only go deeper if necessary.
+Give more detail when necessary.
 
-If the user asks for a short explanation, keep it short.
-
-If the user says "stop waffling", drastically shorten the answer.
-
-HUMOR:
-Humor is allowed.
-Sarcasm is allowed.
-Light teasing is allowed.
-Use emojis occasionally when they fit.
-
-Do not force a joke into every response.
-
-PROFANITY:
-Ordinary profanity is not a problem.
-Do not lecture the user about swearing.
-Do not pretend to be offended.
-
-Do not generate hateful content targeting protected groups or use slurs as insults.
+If the user says "stop waffling",
+make the answer much shorter.
 
 MEMORY:
-If the application provides conversation or memory context, use it.
-Do not falsely claim to have permanent memory if the application has not provided it.
+Long-term memory may be provided below.
 
-SAFETY:
-Do not provide actionable instructions for serious harm.
-If something cannot be provided, explain briefly and move on.
-Do not turn the response into a legal lecture.
+Use it when relevant.
 
-MOST IMPORTANT:
+Do not claim to remember something that is not provided.
+
+Do not mention the memory system unless asked.
+
+Most importantly:
 You are Forza.
-Do not sound like an AI customer-support representative.
-Be concise.
+You are the AI being developed by the user.
 Be useful.
-Have a personality.
+Be concise.
+Have personality.
 """
+
+
 # ============================================================================
-# TERMINAL OUTPUT
+# OUTPUT
 # ============================================================================
 
-def print_system(message: str) -> None:
+def print_system(
+    message: str,
+) -> None:
     """Print a system message."""
 
     print(
@@ -180,8 +819,10 @@ def print_system(message: str) -> None:
     )
 
 
-def print_error(message: str) -> None:
-    """Print an error message."""
+def print_error(
+    message: str,
+) -> None:
+    """Print an error."""
 
     print(
         f"{RED}{BOLD}[ERROR]{RESET} "
@@ -190,7 +831,9 @@ def print_error(message: str) -> None:
     )
 
 
-def print_warning(message: str) -> None:
+def print_warning(
+    message: str,
+) -> None:
     """Print a warning."""
 
     print(
@@ -249,7 +892,34 @@ def print_banner() -> None:
 
 
 # ============================================================================
-# AI INITIALIZATION
+# BOOT GREETING
+# ============================================================================
+
+def get_boot_greeting() -> str:
+    """Generate the boot greeting."""
+
+    name = get_user_name()
+
+    if name:
+        return f"Yo {name}, wassup? 💀"
+
+    return "Yo, wassup? 💀"
+
+
+def print_boot_greeting() -> None:
+    """Print Forza's boot greeting."""
+
+    print_forza_prefix()
+
+    print(
+        get_boot_greeting()
+        + RESET,
+        flush=True,
+    )
+
+
+# ============================================================================
+# AI
 # ============================================================================
 
 def create_ai() -> AIManager:
@@ -257,48 +927,76 @@ def create_ai() -> AIManager:
 
     if settings.ai.provider.lower() != "ollama":
         raise RuntimeError(
-            f"Unsupported AI provider: {settings.ai.provider}"
+            f"Unsupported AI provider: "
+            f"{settings.ai.provider}"
         )
 
     ollama = OllamaProvider(
         model=settings.ai.model,
         host=settings.ai.endpoint,
-        timeout=float(settings.ai.request_timeout),
+        timeout=float(
+            settings.ai.request_timeout
+        ),
     )
 
-    return AIManager(ollama)
+    return AIManager(
+        ollama
+    )
 
-
-# ============================================================================
-# MESSAGE BUILDING
-# ============================================================================
 
 def build_messages(
     messages: Sequence[AIMessage],
 ) -> list[AIMessage]:
-    """
-    Build the conversation sent to the model.
-
-    The personality is injected as a system message every time.
-    """
+    """Build the context sent to the model."""
 
     context_limit = max(
         1,
-        int(settings.ai.max_context_messages),
+        int(
+            settings.ai.max_context_messages
+        ),
     )
+
+    current_message = ""
+
+    for message in reversed(messages):
+        if message.role == "user":
+            current_message = message.content
+            break
+
+    relevant_memories = (
+        get_relevant_memories(
+            current_message
+        )
+    )
+
+    system_content = (
+        FORZA_SYSTEM_PROMPT.strip()
+    )
+
+    memory_context = (
+        format_memory_context(
+            relevant_memories
+        )
+    )
+
+    if memory_context:
+        system_content += (
+            "\n\n"
+            + memory_context
+        )
 
     system_message = AIMessage(
         role="system",
-        content=FORZA_SYSTEM_PROMPT.strip(),
-    )
-
-    recent_messages = list(
-        messages[-context_limit:]
+        content=system_content,
     )
 
     return [
         system_message,
-        *recent_messages,
+        *list(
+            messages[
+                -context_limit:
+            ]
+        ),
     ]
 
 
@@ -310,13 +1008,7 @@ def stream_response(
     manager: AIManager,
     messages: Sequence[AIMessage],
 ) -> tuple[str, bool]:
-    """
-    Stream a response from Ollama.
-
-    Returns:
-        response text
-        whether the response was interrupted
-    """
+    """Stream an AI response."""
 
     global _generating
 
@@ -327,10 +1019,11 @@ def stream_response(
         OllamaProvider,
     ):
         raise RuntimeError(
-            "The configured provider does not support streaming."
+            "The configured provider "
+            "does not support streaming."
         )
 
-    response_parts: list[str] = []
+    parts: list[str] = []
     interrupted = False
 
     _generating = True
@@ -341,7 +1034,7 @@ def stream_response(
         for chunk in provider_instance.stream_chat(
             build_messages(messages)
         ):
-            response_parts.append(chunk)
+            parts.append(chunk)
 
             print(
                 chunk,
@@ -360,7 +1053,10 @@ def stream_response(
             flush=True,
         )
 
-    return "".join(response_parts), interrupted
+    return (
+        "".join(parts),
+        interrupted,
+    )
 
 
 # ============================================================================
@@ -368,13 +1064,15 @@ def stream_response(
 # ============================================================================
 
 def show_status() -> None:
-    """Display Forza status."""
+    """Display Forza's current status."""
 
     print_system(
         f"Runtime: {runtime.state}"
     )
 
-    components = runtime.component_names()
+    components = (
+        runtime.component_names()
+    )
 
     print_system(
         "Components: "
@@ -386,6 +1084,7 @@ def show_status() -> None:
     )
 
     if provider is not None:
+
         print_system(
             f"AI provider: {provider.name}"
         )
@@ -409,51 +1108,59 @@ def show_status() -> None:
         )
 
     print_system(
-        f"Conversation messages: {len(conversation)}"
+        f"Conversation messages: "
+        f"{len(conversation)}"
+    )
+
+    print_system(
+        f"User memories: "
+        f"{len(memory['user'])}"
+    )
+
+    print_system(
+        f"Forza memories: "
+        f"{len(memory['assistant'])}"
+    )
+
+    print_system(
+        f"General memories: "
+        f"{len(memory['general'])}"
     )
 
 
 # ============================================================================
-# SHUTDOWN
+# MEMORY COMMAND
 # ============================================================================
 
-def shutdown() -> None:
-    """Gracefully shut down Forza exactly once."""
+def show_memory() -> None:
+    """Display stored memory."""
 
-    global _shutdown_requested
+    memories = get_all_memories()
 
-    if _shutdown_requested:
+    if not memories:
+        print_system(
+            "No memories stored."
+        )
         return
 
-    _shutdown_requested = True
+    print_system(
+        f"Stored memories: {len(memories)}"
+    )
 
     print()
-    print_system("Shutdown requested.")
 
-    try:
-        if runtime.is_running:
-            runtime.stop()
-
-    except KeyboardInterrupt:
-        print()
-        print_warning(
-            "Shutdown interrupted."
-        )
-
-    except Exception as exc:
-        print_error(
-            f"Runtime shutdown failed: {exc}"
-        )
-
-    else:
-        print_system("Runtime stopped.")
-
-        print_forza_prefix()
-
+    for index, item in enumerate(
+        memories,
+        start=1,
+    ):
         print(
-            "Goodbye."
-            f"{RESET}",
-            flush=True,
+            f"{MAGENTA}{index:>3}.{RESET} "
+            f"[{item['category']}] "
+            f"{item['fact']} "
+            f"{GRAY}"
+            f"(importance "
+            f"{item['importance']}/10)"
+            f"{RESET}"
         )
 
 
@@ -468,13 +1175,15 @@ def handle_command(
     Handle a terminal command.
 
     Returns:
-        False -> shut down
-        True  -> command handled
-        None  -> not a command
+        True  = handled
+        False = shutdown
+        None  = not a command
     """
 
-    command = message.strip().lower()
+    original = message.strip()
+    command = original.casefold()
 
+    # Shutdown
     if command in {
         "shutdown",
         "/shutdown",
@@ -486,6 +1195,7 @@ def handle_command(
         shutdown()
         return False
 
+    # Status
     if command in {
         "status",
         "/status",
@@ -493,6 +1203,7 @@ def handle_command(
         show_status()
         return True
 
+    # Clear conversation
     if command in {
         "clear",
         "/clear",
@@ -505,16 +1216,99 @@ def handle_command(
 
         return True
 
+    # Show memory
+    if command in {
+        "memory",
+        "/memory",
+        "memories",
+        "/memories",
+    }:
+        show_memory()
+        return True
+
+    # Remember
+    if command.startswith(
+        (
+            "remember ",
+            "/remember ",
+        )
+    ):
+        fact = original.split(
+            " ",
+            1,
+        )[1].strip()
+
+        if add_memory(
+            fact,
+            category="general",
+            importance=7,
+        ):
+            print_system(
+                "Memory saved."
+            )
+        else:
+            print_system(
+                "That memory already exists."
+            )
+
+        return True
+
+    # Forget
+    if command.startswith(
+        (
+            "forget ",
+            "/forget ",
+        )
+    ):
+        query = original.split(
+            " ",
+            1,
+        )[1].strip()
+
+        removed = remove_memory(
+            query
+        )
+
+        if removed:
+            print_system(
+                f"Removed {removed} "
+                f"matching "
+                f"{'memory' if removed == 1 else 'memories'}."
+            )
+        else:
+            print_system(
+                "No matching memories found."
+            )
+
+        return True
+
+    # Clear memory
+    if command in {
+        "clear_memory",
+        "/clear_memory",
+    }:
+        count = clear_memory()
+
+        print_system(
+            f"Cleared {count} "
+            f"user/general memories."
+        )
+
+        return True
+
+    # Help
     if command in {
         "help",
         "/help",
     }:
         print_system(
-            "Commands: status, clear, shutdown"
+            "Commands: status, clear, memory, "
+            "remember <fact>, forget <fact>, "
+            "clear_memory, help, shutdown"
         )
 
         print_system(
-            "Ctrl+C cancels the current response."
+            "Ctrl+C interrupts the current response."
         )
 
         return True
@@ -529,12 +1323,14 @@ def handle_command(
 def handle_message(
     message: str,
 ) -> bool:
-    """Handle one user message."""
+    """Process one user message."""
 
     if not message.strip():
         return True
 
-    command_result = handle_command(message)
+    command_result = handle_command(
+        message
+    )
 
     if command_result is not None:
         return command_result
@@ -546,26 +1342,27 @@ def handle_message(
 
         return True
 
+    cleaned = message.strip()
+
+    # Detect explicit facts before generating a response.
+    automatically_store_memory(
+        cleaned
+    )
+
     conversation.append(
         AIMessage(
             role="user",
-            content=message.strip(),
+            content=cleaned,
         )
     )
 
     try:
-        response, interrupted = stream_response(
-            ai,
-            conversation,
+        response, interrupted = (
+            stream_response(
+                ai,
+                conversation,
+            )
         )
-
-    except RuntimeError as exc:
-        print_error(str(exc))
-
-        # Remove user message if the request failed.
-        conversation.pop()
-
-        return True
 
     except Exception as exc:
         print_error(
@@ -584,7 +1381,6 @@ def handle_message(
             flush=True,
         )
 
-        # Don't save partial responses.
         return True
 
     if response.strip():
@@ -605,7 +1401,7 @@ def handle_message(
 # ============================================================================
 
 def chat_loop() -> None:
-    """Run the interactive terminal."""
+    """Run the interactive chat loop."""
 
     print_system(
         "Type a message to talk to Forza."
@@ -620,20 +1416,25 @@ def chat_loop() -> None:
     )
 
     print_system(
-        "Commands: status, clear, help, shutdown"
+        "Commands: status, clear, memory, "
+        "remember <fact>, forget <fact>, "
+        "clear_memory, help, shutdown"
     )
 
     print()
 
-    while runtime.is_running and not _shutdown_requested:
+    while (
+        runtime.is_running
+        and not _shutdown_requested
+    ):
         try:
             print_user_prefix()
+
             user_message = input()
 
         except KeyboardInterrupt:
             print()
 
-            # Ctrl+C at the input prompt does NOT shut down.
             print_system(
                 "Input cancelled."
             )
@@ -645,16 +1446,58 @@ def chat_loop() -> None:
         except EOFError:
             print()
 
-            # Genuine EOF means the terminal/input stream closed.
-            print_system(
-                "Input closed."
-            )
-
             shutdown()
+
             return
 
-        if not handle_message(user_message):
+        if not handle_message(
+            user_message
+        ):
             return
+
+
+# ============================================================================
+# SHUTDOWN
+# ============================================================================
+
+def shutdown() -> None:
+    """Gracefully shut down Forza."""
+
+    global _shutdown_requested
+
+    if _shutdown_requested:
+        return
+
+    _shutdown_requested = True
+
+    print()
+
+    print_system(
+        "Shutdown requested."
+    )
+
+    try:
+        if runtime.is_running:
+            runtime.stop()
+
+    except Exception as exc:
+        print_error(
+            f"Runtime shutdown failed: {exc}"
+        )
+
+    else:
+        print_system(
+            "Runtime stopped."
+        )
+
+        print_forza_prefix()
+
+        print(
+            "Goodbye."
+            f"{RESET}",
+            flush=True,
+        )
+
 
 # ============================================================================
 # SIGNAL HANDLING
@@ -664,17 +1507,11 @@ def handle_signal(
     signum: int,
     frame: FrameType | None,
 ) -> None:
-    """
-    Handle operating-system signals.
-
-    Ctrl+C during generation is allowed to interrupt the generator.
-    Ctrl+C while waiting for input is handled by input().
-    """
+    """Handle Ctrl+C without killing the application."""
 
     if _generating:
         raise KeyboardInterrupt
 
-    # Do not turn Ctrl+C into an automatic shutdown.
     print()
 
     print_system(
@@ -698,7 +1535,41 @@ def main() -> int:
     global provider
     global ai
 
+    # ------------------------------------------------------------------------
+    # 1. BANNER
+    # ------------------------------------------------------------------------
+
     print_banner()
+
+    # ------------------------------------------------------------------------
+    # 2. MEMORY
+    # ------------------------------------------------------------------------
+
+    print_system(
+        "Loading long-term memory..."
+    )
+
+    try:
+        load_memory()
+
+        print_system(
+            f"Loaded "
+            f"{len(get_all_memories())} "
+            f"memories."
+        )
+
+    except Exception as exc:
+        print_warning(
+            f"Memory loading failed: {exc}"
+        )
+
+        memory.clear()
+
+    # ------------------------------------------------------------------------
+    # 3. RUNTIME
+    # ------------------------------------------------------------------------
+
+    print()
 
     print_system(
         "Starting runtime..."
@@ -711,25 +1582,37 @@ def main() -> int:
             "Runtime started."
         )
 
+        # --------------------------------------------------------------------
+        # 4. AI INITIALIZATION
+        # --------------------------------------------------------------------
+
         ai = create_ai()
 
         provider = ai.provider
 
         print_system(
-            f"AI provider: {provider.name}"
+            f"AI provider: "
+            f"{provider.name}"
         )
 
         print_system(
-            f"AI model: {provider.model}"
+            f"AI model: "
+            f"{provider.model}"
         )
 
+        # --------------------------------------------------------------------
+        # 5. OLLAMA CHECK
+        # --------------------------------------------------------------------
+
         if provider.available():
+
             print_system(
-                f"Ollama connection: "
+                "Ollama connection: "
                 f"{GREEN}ready{RESET}"
             )
 
         else:
+
             print_error(
                 "Ollama is not reachable."
             )
@@ -738,12 +1621,26 @@ def main() -> int:
                 "Start Ollama before sending messages."
             )
 
+        # --------------------------------------------------------------------
+        # 6. BOOT GREETING
+        # --------------------------------------------------------------------
+
         print()
+
+        print_boot_greeting()
+
+        print()
+
+        # --------------------------------------------------------------------
+        # 7. CHAT
+        # --------------------------------------------------------------------
 
         chat_loop()
 
     except Exception as exc:
+
         if not _shutdown_requested:
+
             print_error(
                 f"Forza failed to start: {exc}"
             )
@@ -751,7 +1648,6 @@ def main() -> int:
             try:
                 if runtime.is_running:
                     runtime.stop()
-
             except Exception:
                 pass
 
@@ -771,7 +1667,10 @@ if __name__ == "__main__":
         handle_signal,
     )
 
-    if hasattr(signal, "SIGTERM"):
+    if hasattr(
+        signal,
+        "SIGTERM",
+    ):
         signal.signal(
             signal.SIGTERM,
             handle_signal,
