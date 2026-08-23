@@ -38,3 +38,6 @@ model/
 *.db
 *.sqlite
 *.sqlite3
+
+# Forza persistent user memory
+data/memory/memories.json

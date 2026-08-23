@@ -6,22 +6,15 @@ Main interactive runtime for Forza.
 
 Boot order:
     1. Display banner
-    2. Load persistent memory
+    2. Load long-term memory
     3. Start runtime
     4. Initialize AI
     5. Check Ollama
     6. Greet the user
     7. Start chat
 
-Commands:
-    status
-    clear
-    memory
-    remember <fact>
-    forget <fact>
-    clear_memory
-    help
-    shutdown
+Memory is stored outside the Git repository using
+Forza's cross-platform persistent data directory.
 """
 
 from __future__ import annotations
@@ -85,14 +78,16 @@ memory: dict[str, list[dict[str, object]]] = {
 
 
 def get_memory_file() -> Path:
-    """Return Forza's persistent memory file."""
+    """
+    Return Forza's persistent memory file.
 
-    project_root = Path(__file__).resolve().parent
+    IMPORTANT:
+    This uses Forza's platform-specific application-data directory,
+    NOT the Git repository.
+    """
 
-    memory_directory = (
-        project_root
-        / "data"
-        / "memory"
+    memory_directory = Path(
+        settings.paths.memory
     )
 
     memory_directory.mkdir(
@@ -100,11 +95,11 @@ def get_memory_file() -> Path:
         exist_ok=True,
     )
 
-    return memory_directory / "memories.json"
+    return memory_directory / MEMORY_FILE_NAME
 
 
 def default_memory() -> dict[str, list[dict[str, object]]]:
-    """Return Forza's built-in identity memories."""
+    """Return Forza's permanent identity memories."""
 
     return {
         "user": [],
@@ -119,7 +114,7 @@ def default_memory() -> dict[str, list[dict[str, object]]]:
             {
                 "fact": (
                     "The user is developing and "
-                    "improving my capabilities."
+                    "improving Forza AI."
                 ),
                 "importance": 10,
             },
@@ -131,90 +126,100 @@ def default_memory() -> dict[str, list[dict[str, object]]]:
 def normalize_memory(
     data: object,
 ) -> dict[str, list[dict[str, object]]]:
-    """Normalize memory data loaded from disk."""
+    """Normalize memory data without deleting valid memories."""
 
-    normalized = default_memory()
+    normalized = {
+        "user": [],
+        "assistant": [],
+        "general": [],
+    }
 
     if isinstance(data, list):
+
         for item in data:
+
             if isinstance(item, str) and item.strip():
+
                 normalized["general"].append(
                     {
-                        "fact": item.strip(),
+                        "fact": item.strip()[:500],
                         "importance": 5,
                     }
                 )
 
-        return normalized
+    elif isinstance(data, dict):
 
-    if not isinstance(data, dict):
-        return normalized
+        for category in (
+            "user",
+            "assistant",
+            "general",
+        ):
 
-    for category in (
-        "user",
-        "assistant",
-        "general",
-    ):
-        values = data.get(
-            category,
-            [],
-        )
-
-        if not isinstance(values, list):
-            continue
-
-        for item in values:
-
-            if isinstance(item, str):
-                fact = item.strip()
-                importance = 5
-
-            elif isinstance(item, dict):
-                fact = str(
-                    item.get(
-                        "fact",
-                        "",
-                    )
-                ).strip()
-
-                try:
-                    importance = int(
-                        item.get(
-                            "importance",
-                            5,
-                        )
-                    )
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    importance = 5
-
-            else:
-                continue
-
-            if not fact:
-                continue
-
-            normalized[category].append(
-                {
-                    "fact": fact[:500],
-                    "importance": max(
-                        1,
-                        min(
-                            importance,
-                            10,
-                        ),
-                    ),
-                }
+            values = data.get(
+                category,
+                [],
             )
 
-    # Remove duplicate facts.
+            if not isinstance(values, list):
+                continue
+
+            for item in values:
+
+                if isinstance(item, str):
+
+                    fact = item.strip()
+                    importance = 5
+
+                elif isinstance(item, dict):
+
+                    fact = str(
+                        item.get(
+                            "fact",
+                            "",
+                        )
+                    ).strip()
+
+                    try:
+                        importance = int(
+                            item.get(
+                                "importance",
+                                5,
+                            )
+                        )
+
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
+                        importance = 5
+
+                else:
+                    continue
+
+                if not fact:
+                    continue
+
+                normalized[category].append(
+                    {
+                        "fact": fact[:500],
+                        "importance": max(
+                            1,
+                            min(
+                                importance,
+                                10,
+                            ),
+                        ),
+                    }
+                )
+
+    # Remove duplicates.
     for category in normalized:
-        unique = []
+
+        unique: list[dict[str, object]] = []
         seen: set[str] = set()
 
         for item in normalized[category]:
+
             fact = str(
                 item["fact"]
             ).strip()
@@ -233,56 +238,84 @@ def normalize_memory(
 
 
 def load_memory() -> None:
-    """Load persistent memory."""
+    """
+    Load memory from disk.
+
+    IMPORTANT:
+    Loading NEVER writes to the memory file.
+    """
 
     global memory
 
     memory_file = get_memory_file()
 
     if not memory_file.exists():
+
         memory = default_memory()
+
         save_memory()
+
         return
 
     try:
+
         with memory_file.open(
             "r",
             encoding="utf-8",
         ) as file:
+
             data = json.load(file)
 
         memory = normalize_memory(data)
 
-        # Always preserve Forza's core identity.
-        built_in = default_memory()
+        # Add missing built-in identity memories.
+        defaults = default_memory()
 
         existing = {
             str(item["fact"]).casefold()
             for item in memory["assistant"]
         }
 
-        for item in built_in["assistant"]:
+        changed = False
+
+        for item in defaults["assistant"]:
+
             fact = str(
                 item["fact"]
             )
 
             if fact.casefold() not in existing:
-                memory["assistant"].append(item)
 
-        save_memory()
+                memory["assistant"].append(
+                    item
+                )
 
-    except (
-        OSError,
-        json.JSONDecodeError,
-        TypeError,
-        ValueError,
-    ):
+                changed = True
+
+        # Only write if something genuinely needed adding.
+        if changed:
+            save_memory()
+
+    except json.JSONDecodeError:
+
+        print_warning(
+            "Memory file is invalid. "
+            "Existing file was NOT overwritten."
+        )
+
         memory = default_memory()
-        save_memory()
+
+    except OSError as exc:
+
+        print_warning(
+            f"Could not read memory: {exc}"
+        )
+
+        memory = default_memory()
 
 
 def save_memory() -> None:
-    """Safely save memory to disk."""
+    """Atomically save persistent memory."""
 
     memory_file = get_memory_file()
 
@@ -294,6 +327,7 @@ def save_memory() -> None:
         "w",
         encoding="utf-8",
     ) as file:
+
         json.dump(
             memory,
             file,
@@ -311,7 +345,7 @@ def add_memory(
     category: str = "general",
     importance: int = 5,
 ) -> bool:
-    """Add a memory if it does not already exist."""
+    """Add a permanent memory."""
 
     if category not in memory:
         category = "general"
@@ -322,7 +356,10 @@ def add_memory(
         return False
 
     try:
-        importance = int(importance)
+        importance = int(
+            importance
+        )
+
     except (
         TypeError,
         ValueError,
@@ -360,7 +397,7 @@ def add_memory(
 def remove_memory(
     query: str,
 ) -> int:
-    """Remove memories containing the given text."""
+    """Remove memories matching a search term."""
 
     query = query.strip().casefold()
 
@@ -370,7 +407,8 @@ def remove_memory(
     removed = 0
 
     for category in memory:
-        before = len(
+
+        original_count = len(
             memory[category]
         )
 
@@ -384,7 +422,7 @@ def remove_memory(
         ]
 
         removed += (
-            before
+            original_count
             - len(memory[category])
         )
 
@@ -395,11 +433,7 @@ def remove_memory(
 
 
 def clear_memory() -> int:
-    """
-    Clear user/general memories.
-
-    Forza's identity memories are preserved.
-    """
+    """Clear user/general memory while preserving Forza identity."""
 
     count = (
         len(memory["user"])
@@ -418,17 +452,19 @@ def get_user_name() -> str | None:
     """Return the user's remembered name."""
 
     for item in memory["user"]:
+
         fact = str(
             item["fact"]
         )
 
         match = re.search(
-            r"user'?s name is\s+(.+?)(?:[.!?]|$)",
+            r"user'?s name is\s+([^.!?,]+)",
             fact,
             flags=re.IGNORECASE,
         )
 
         if match:
+
             name = match.group(1).strip()
 
             if name:
@@ -438,7 +474,7 @@ def get_user_name() -> str | None:
 
 
 def get_all_memories() -> list[dict[str, object]]:
-    """Return all stored memories."""
+    """Return every stored memory."""
 
     result = []
 
@@ -447,7 +483,9 @@ def get_all_memories() -> list[dict[str, object]]:
         "assistant",
         "general",
     ):
+
         for item in memory[category]:
+
             result.append(
                 {
                     "category": category,
@@ -459,119 +497,76 @@ def get_all_memories() -> list[dict[str, object]]:
     return result
 
 
-def get_relevant_memories(
-    message: str,
-) -> list[dict[str, object]]:
+def get_memory_context() -> str:
     """
-    Find memories relevant to a message.
+    Build the memory context sent to Forza.
 
-    Core identity memories are always included.
-    Other memories are selected using keyword overlap.
+    User memories are always included.
+
+    This is intentional. With a small personal memory store,
+    keyword matching is unnecessary and can cause Forza to
+    forget relevant information simply because the user said
+    'what are my interests?' instead of 'what do I like?'
     """
-
-    all_memories = get_all_memories()
-
-    if not all_memories:
-        return []
-
-    message_words = set(
-        re.findall(
-            r"[a-zA-Z0-9_]+",
-            message.casefold(),
-        )
-    )
-
-    scored = []
-
-    for item in all_memories:
-        fact = str(
-            item["fact"]
-        )
-
-        importance = int(
-            item["importance"]
-        )
-
-        fact_words = set(
-            re.findall(
-                r"[a-zA-Z0-9_]+",
-                fact.casefold(),
-            )
-        )
-
-        overlap = len(
-            message_words & fact_words
-        )
-
-        score = (
-            overlap * 3
-            + importance
-        )
-
-        # Importance 10 = core identity/important memory.
-        if importance >= 10:
-            score += 20
-
-        if overlap > 0 or importance >= 10:
-            scored.append(
-                (
-                    score,
-                    item,
-                )
-            )
-
-    scored.sort(
-        key=lambda item: item[0],
-        reverse=True,
-    )
-
-    return [
-        item
-        for _, item in scored[:12]
-    ]
-
-
-def format_memory_context(
-    memories: Sequence[dict[str, object]],
-) -> str:
-    """Format memory for the AI system prompt."""
-
-    if not memories:
-        return ""
 
     lines = [
         "LONG-TERM MEMORY:",
         "",
+        "USER MEMORIES:",
     ]
 
-    for item in memories:
-        category = str(
-            item["category"]
-        )
+    if memory["user"]:
 
-        fact = str(
-            item["fact"]
-        )
+        for item in memory["user"]:
 
-        if category == "user":
-            prefix = "USER"
-        elif category == "assistant":
-            prefix = "FORZA"
-        else:
-            prefix = "GENERAL"
+            lines.append(
+                f"- {item['fact']}"
+            )
+
+    else:
 
         lines.append(
-            f"- {prefix}: {fact}"
+            "- No user memories stored."
         )
 
     lines.extend(
         [
             "",
-            "Use these memories when relevant.",
-            "Do not mention the memory system unless asked.",
-            "Do not invent memories.",
-            "FORZA memories describe your identity.",
-            "USER memories describe the person using you.",
+            "FORZA IDENTITY:",
+        ]
+    )
+
+    for item in memory["assistant"]:
+
+        lines.append(
+            f"- {item['fact']}"
+        )
+
+    if memory["general"]:
+
+        lines.extend(
+            [
+                "",
+                "GENERAL MEMORIES:",
+            ]
+        )
+
+        for item in memory["general"]:
+
+            lines.append(
+                f"- {item['fact']}"
+            )
+
+    lines.extend(
+        [
+            "",
+            "MEMORY RULES:",
+            "- Use these memories when relevant.",
+            "- Never invent memories.",
+            "- Never claim to remember something that is not here.",
+            "- User memories describe the user.",
+            "- Forza identity memories describe Forza.",
+            "- Do not mention the memory system unless asked.",
         ]
     )
 
@@ -581,24 +576,30 @@ def format_memory_context(
 def automatically_store_memory(
     message: str,
 ) -> None:
-    """Detect explicit facts worth remembering."""
+    """
+    Detect explicit personal facts from the user's message.
+
+    This intentionally handles several facts in one sentence.
+    """
 
     text = message.strip()
 
     # ------------------------------------------------------------------------
-    # User name
+    # NAME
     # ------------------------------------------------------------------------
 
-    match = re.search(
-        r"\bmy name is\s+(.+?)(?:[.!?]|$)",
+    name_match = re.search(
+        r"\bmy name is\s+([^,.!?]+)",
         text,
         flags=re.IGNORECASE,
     )
 
-    if match:
-        name = match.group(1).strip()
+    if name_match:
+
+        name = name_match.group(1).strip()
 
         if name:
+
             add_memory(
                 f"User's name is {name}.",
                 category="user",
@@ -606,70 +607,107 @@ def automatically_store_memory(
             )
 
     # ------------------------------------------------------------------------
-    # User facts
+    # LIKE / LOVE
     # ------------------------------------------------------------------------
 
-    user_patterns = [
-        (
-            r"\bi like\s+(.+)",
-            "User likes {}.",
-            7,
-        ),
-        (
-            r"\bi love\s+(.+)",
-            "User loves {}.",
-            7,
-        ),
-        (
-            r"\bi prefer\s+(.+)",
-            "User prefers {}.",
-            7,
-        ),
-        (
-            r"\bi play\s+(.+)",
-            "User plays {}.",
-            6,
-        ),
-        (
-            r"\bi read\s+(.+)",
-            "User reads {}.",
-            6,
-        ),
-        (
-            r"\bi(?:'m| am) building\s+(.+)",
-            "User is building {}.",
-            9,
-        ),
-        (
-            r"\bi(?:'m| am) working on\s+(.+)",
-            "User is working on {}.",
-            9,
-        ),
-    ]
+    like_match = re.search(
+        r"\bi (?:like|love)\s+(.+?)(?:(?:\.\s)|(?:!\s)|(?:\?\s)|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    for pattern, template, importance in user_patterns:
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE,
-        )
+    if like_match:
 
-        if not match:
-            continue
+        interests = like_match.group(1).strip()
 
-        value = match.group(1).strip()
+        if interests:
 
-        if not value or len(value) > 300:
-            continue
+            verb = (
+                "loves"
+                if re.search(
+                    r"\bi love\b",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+                else "likes"
+            )
 
-        add_memory(
-            template.format(value),
-            category="user",
-            importance=importance,
-        )
+            add_memory(
+                f"User {verb} {interests}.",
+                category="user",
+                importance=8,
+            )
 
     # ------------------------------------------------------------------------
-    # Forza identity
+    # PLAY
+    # ------------------------------------------------------------------------
+
+    play_match = re.search(
+        r"\bi play\s+(.+?)(?:(?:\.\s)|(?:!\s)|(?:\?\s)|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if play_match:
+
+        games_or_sports = (
+            play_match.group(1).strip()
+        )
+
+        if games_or_sports:
+
+            add_memory(
+                f"User plays {games_or_sports}.",
+                category="user",
+                importance=7,
+            )
+
+    # ------------------------------------------------------------------------
+    # READ
+    # ------------------------------------------------------------------------
+
+    read_match = re.search(
+        r"\bi read\s+(.+?)(?:(?:\.\s)|(?:!\s)|(?:\?\s)|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if read_match:
+
+        books = read_match.group(1).strip()
+
+        if books:
+
+            add_memory(
+                f"User reads {books}.",
+                category="user",
+                importance=7,
+            )
+
+    # ------------------------------------------------------------------------
+    # BUILDING / WORKING ON
+    # ------------------------------------------------------------------------
+
+    project_match = re.search(
+        r"\bi(?:'m| am)\s+(?:building|working on)\s+(.+?)(?:(?:\.\s)|(?:!\s)|(?:\?\s)|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if project_match:
+
+        project = project_match.group(1).strip()
+
+        if project:
+
+            add_memory(
+                f"User is working on {project}.",
+                category="user",
+                importance=9,
+            )
+
+    # ------------------------------------------------------------------------
+    # FORZA IDENTITY
     # ------------------------------------------------------------------------
 
     identity_patterns = [
@@ -696,11 +734,13 @@ def automatically_store_memory(
     ]
 
     for pattern, fact in identity_patterns:
+
         if re.search(
             pattern,
             text,
             flags=re.IGNORECASE,
         ):
+
             add_memory(
                 fact,
                 category="assistant",
@@ -709,7 +749,7 @@ def automatically_store_memory(
 
 
 # ============================================================================
-# FORZA SYSTEM PROMPT
+# SYSTEM PROMPT
 # ============================================================================
 
 FORZA_SYSTEM_PROMPT = """
@@ -722,84 +762,49 @@ The user is actively developing and improving you.
 IDENTITY:
 - You are Forza.
 - You are the AI being developed by the user.
-- The user may call you "Forza", "the AI", or "you".
+- The user may call you Forza, the AI, or you.
 - Understand that these refer to you.
-- Do not pretend you are a generic customer-service chatbot.
+- Do not behave like a generic customer-service chatbot.
 
 PERSONALITY:
 - Casual
 - Funny when appropriate
 - Slightly sarcastic
 - Confident
-- Direct
 - Playful
 - Smart
+- Direct
 - Human-sounding
-- Serious when necessary
 
-Do not talk like a corporate chatbot.
+Speak naturally.
 
-Avoid phrases such as:
-"Certainly! I'd be happy to assist you."
+Do not constantly ask follow-up questions.
+
+Do not repeatedly say:
 "How can I help you today?"
 "What can I get you today?"
+"Certainly!"
 "Great question!"
-"Please feel free to ask."
-"I understand you may be frustrated."
+"I'd be happy to assist."
 
-Instead, speak naturally.
-
-If the user says:
-"bro"
-
-A natural response could be:
-"yo 💀"
-
-If the user says:
-"nah bro im improving you"
-
-Understand that they mean they are developing Forza AI.
-
-Do not respond as though you are a generic chatbot.
-
-STYLE:
-- Short sentences by default.
-- Don't restate the user's question.
-- Don't constantly ask follow-up questions.
-- Don't turn casual conversation into an essay.
-- Use humor when it fits.
-- Use emojis occasionally.
-- Don't force jokes.
-
-RESPONSE LENGTH:
-Casual message:
-Usually 1-2 sentences.
-
-Simple question:
-2-5 sentences.
-
-Technical question:
-Explain the important part first.
-Give more detail when necessary.
-
-If the user says "stop waffling",
-make the answer much shorter.
+If the user says they are improving or building you,
+understand that they are developing Forza AI.
 
 MEMORY:
-Long-term memory may be provided below.
+Long-term memory is supplied below.
 
-Use it when relevant.
+Use it naturally.
 
-Do not claim to remember something that is not provided.
+If the user asks about their name, interests,
+preferences, projects, hobbies, or other stored facts,
+answer directly using the memory.
 
-Do not mention the memory system unless asked.
+Never invent personal information.
 
-Most importantly:
+Never say the user is "the user" when their name
+or relevant personal information is available.
+
 You are Forza.
-You are the AI being developed by the user.
-Be useful.
-Be concise.
-Have personality.
 """
 
 
@@ -810,7 +815,6 @@ Have personality.
 def print_system(
     message: str,
 ) -> None:
-    """Print a system message."""
 
     print(
         f"{CYAN}{BOLD}[SYSTEM]{RESET} "
@@ -822,7 +826,6 @@ def print_system(
 def print_error(
     message: str,
 ) -> None:
-    """Print an error."""
 
     print(
         f"{RED}{BOLD}[ERROR]{RESET} "
@@ -834,7 +837,6 @@ def print_error(
 def print_warning(
     message: str,
 ) -> None:
-    """Print a warning."""
 
     print(
         f"{YELLOW}{BOLD}[WARNING]{RESET} "
@@ -844,7 +846,6 @@ def print_warning(
 
 
 def print_forza_prefix() -> None:
-    """Print the Forza response prefix."""
 
     print(
         f"{GREEN}{BOLD}Forza-AI:{RESET} "
@@ -855,7 +856,6 @@ def print_forza_prefix() -> None:
 
 
 def print_user_prefix() -> None:
-    """Print the user prompt."""
 
     print(
         f"{BLUE}{BOLD}User:{RESET} ",
@@ -869,7 +869,6 @@ def print_user_prefix() -> None:
 # ============================================================================
 
 def print_banner() -> None:
-    """Display the Forza banner."""
 
     print()
 
@@ -896,7 +895,6 @@ def print_banner() -> None:
 # ============================================================================
 
 def get_boot_greeting() -> str:
-    """Generate the boot greeting."""
 
     name = get_user_name()
 
@@ -907,7 +905,6 @@ def get_boot_greeting() -> str:
 
 
 def print_boot_greeting() -> None:
-    """Print Forza's boot greeting."""
 
     print_forza_prefix()
 
@@ -923,9 +920,9 @@ def print_boot_greeting() -> None:
 # ============================================================================
 
 def create_ai() -> AIManager:
-    """Create the configured AI manager."""
 
     if settings.ai.provider.lower() != "ollama":
+
         raise RuntimeError(
             f"Unsupported AI provider: "
             f"{settings.ai.provider}"
@@ -947,7 +944,6 @@ def create_ai() -> AIManager:
 def build_messages(
     messages: Sequence[AIMessage],
 ) -> list[AIMessage]:
-    """Build the context sent to the model."""
 
     context_limit = max(
         1,
@@ -956,42 +952,17 @@ def build_messages(
         ),
     )
 
-    current_message = ""
-
-    for message in reversed(messages):
-        if message.role == "user":
-            current_message = message.content
-            break
-
-    relevant_memories = (
-        get_relevant_memories(
-            current_message
-        )
-    )
-
     system_content = (
         FORZA_SYSTEM_PROMPT.strip()
-    )
-
-    memory_context = (
-        format_memory_context(
-            relevant_memories
-        )
-    )
-
-    if memory_context:
-        system_content += (
-            "\n\n"
-            + memory_context
-        )
-
-    system_message = AIMessage(
-        role="system",
-        content=system_content,
+        + "\n\n"
+        + get_memory_context()
     )
 
     return [
-        system_message,
+        AIMessage(
+            role="system",
+            content=system_content,
+        ),
         *list(
             messages[
                 -context_limit:
@@ -1008,7 +979,6 @@ def stream_response(
     manager: AIManager,
     messages: Sequence[AIMessage],
 ) -> tuple[str, bool]:
-    """Stream an AI response."""
 
     global _generating
 
@@ -1018,6 +988,7 @@ def stream_response(
         provider_instance,
         OllamaProvider,
     ):
+
         raise RuntimeError(
             "The configured provider "
             "does not support streaming."
@@ -1031,9 +1002,11 @@ def stream_response(
     print_forza_prefix()
 
     try:
+
         for chunk in provider_instance.stream_chat(
             build_messages(messages)
         ):
+
             parts.append(chunk)
 
             print(
@@ -1043,9 +1016,11 @@ def stream_response(
             )
 
     except KeyboardInterrupt:
+
         interrupted = True
 
     finally:
+
         _generating = False
 
         print(
@@ -1064,23 +1039,9 @@ def stream_response(
 # ============================================================================
 
 def show_status() -> None:
-    """Display Forza's current status."""
 
     print_system(
         f"Runtime: {runtime.state}"
-    )
-
-    components = (
-        runtime.component_names()
-    )
-
-    print_system(
-        "Components: "
-        + (
-            ", ".join(components)
-            if components
-            else "None registered"
-        )
     )
 
     if provider is not None:
@@ -1095,6 +1056,7 @@ def show_status() -> None:
 
         try:
             available = provider.available()
+
         except Exception:
             available = False
 
@@ -1108,8 +1070,12 @@ def show_status() -> None:
         )
 
     print_system(
-        f"Conversation messages: "
-        f"{len(conversation)}"
+        f"Memory file: {get_memory_file()}"
+    )
+
+    print_system(
+        f"Total memories: "
+        f"{len(get_all_memories())}"
     )
 
     print_system(
@@ -1129,18 +1095,19 @@ def show_status() -> None:
 
 
 # ============================================================================
-# MEMORY COMMAND
+# MEMORY DISPLAY
 # ============================================================================
 
 def show_memory() -> None:
-    """Display stored memory."""
 
     memories = get_all_memories()
 
     if not memories:
+
         print_system(
             "No memories stored."
         )
+
         return
 
     print_system(
@@ -1153,6 +1120,7 @@ def show_memory() -> None:
         memories,
         start=1,
     ):
+
         print(
             f"{MAGENTA}{index:>3}.{RESET} "
             f"[{item['category']}] "
@@ -1171,19 +1139,10 @@ def show_memory() -> None:
 def handle_command(
     message: str,
 ) -> bool | None:
-    """
-    Handle a terminal command.
-
-    Returns:
-        True  = handled
-        False = shutdown
-        None  = not a command
-    """
 
     original = message.strip()
     command = original.casefold()
 
-    # Shutdown
     if command in {
         "shutdown",
         "/shutdown",
@@ -1192,22 +1151,25 @@ def handle_command(
         "quit",
         "/quit",
     }:
+
         shutdown()
+
         return False
 
-    # Status
     if command in {
         "status",
         "/status",
     }:
+
         show_status()
+
         return True
 
-    # Clear conversation
     if command in {
         "clear",
         "/clear",
     }:
+
         conversation.clear()
 
         print_system(
@@ -1216,23 +1178,24 @@ def handle_command(
 
         return True
 
-    # Show memory
     if command in {
         "memory",
         "/memory",
         "memories",
         "/memories",
     }:
+
         show_memory()
+
         return True
 
-    # Remember
     if command.startswith(
         (
             "remember ",
             "/remember ",
         )
     ):
+
         fact = original.split(
             " ",
             1,
@@ -1243,23 +1206,26 @@ def handle_command(
             category="general",
             importance=7,
         ):
+
             print_system(
-                "Memory saved."
+                "Memory saved permanently."
             )
+
         else:
+
             print_system(
                 "That memory already exists."
             )
 
         return True
 
-    # Forget
     if command.startswith(
         (
             "forget ",
             "/forget ",
         )
     ):
+
         query = original.split(
             " ",
             1,
@@ -1270,37 +1236,39 @@ def handle_command(
         )
 
         if removed:
+
             print_system(
                 f"Removed {removed} "
                 f"matching "
                 f"{'memory' if removed == 1 else 'memories'}."
             )
+
         else:
+
             print_system(
                 "No matching memories found."
             )
 
         return True
 
-    # Clear memory
     if command in {
         "clear_memory",
         "/clear_memory",
     }:
+
         count = clear_memory()
 
         print_system(
-            f"Cleared {count} "
-            f"user/general memories."
+            f"Cleared {count} user/general memories."
         )
 
         return True
 
-    # Help
     if command in {
         "help",
         "/help",
     }:
+
         print_system(
             "Commands: status, clear, memory, "
             "remember <fact>, forget <fact>, "
@@ -1323,7 +1291,6 @@ def handle_command(
 def handle_message(
     message: str,
 ) -> bool:
-    """Process one user message."""
 
     if not message.strip():
         return True
@@ -1336,6 +1303,7 @@ def handle_message(
         return command_result
 
     if ai is None:
+
         print_error(
             "AI manager is not initialized."
         )
@@ -1344,7 +1312,7 @@ def handle_message(
 
     cleaned = message.strip()
 
-    # Detect explicit facts before generating a response.
+    # Store facts BEFORE generating the response.
     automatically_store_memory(
         cleaned
     )
@@ -1357,6 +1325,7 @@ def handle_message(
     )
 
     try:
+
         response, interrupted = (
             stream_response(
                 ai,
@@ -1365,6 +1334,7 @@ def handle_message(
         )
 
     except Exception as exc:
+
         print_error(
             f"AI response failed: {exc}"
         )
@@ -1374,6 +1344,7 @@ def handle_message(
         return True
 
     if interrupted:
+
         print(
             f"{YELLOW}"
             "[Response interrupted]"
@@ -1384,6 +1355,7 @@ def handle_message(
         return True
 
     if response.strip():
+
         conversation.append(
             AIMessage(
                 role="assistant",
@@ -1401,7 +1373,6 @@ def handle_message(
 # ============================================================================
 
 def chat_loop() -> None:
-    """Run the interactive chat loop."""
 
     print_system(
         "Type a message to talk to Forza."
@@ -1427,12 +1398,15 @@ def chat_loop() -> None:
         runtime.is_running
         and not _shutdown_requested
     ):
+
         try:
+
             print_user_prefix()
 
             user_message = input()
 
         except KeyboardInterrupt:
+
             print()
 
             print_system(
@@ -1444,6 +1418,7 @@ def chat_loop() -> None:
             continue
 
         except EOFError:
+
             print()
 
             shutdown()
@@ -1453,6 +1428,7 @@ def chat_loop() -> None:
         if not handle_message(
             user_message
         ):
+
             return
 
 
@@ -1461,7 +1437,6 @@ def chat_loop() -> None:
 # ============================================================================
 
 def shutdown() -> None:
-    """Gracefully shut down Forza."""
 
     global _shutdown_requested
 
@@ -1477,15 +1452,18 @@ def shutdown() -> None:
     )
 
     try:
+
         if runtime.is_running:
             runtime.stop()
 
     except Exception as exc:
+
         print_error(
             f"Runtime shutdown failed: {exc}"
         )
 
     else:
+
         print_system(
             "Runtime stopped."
         )
@@ -1507,9 +1485,9 @@ def handle_signal(
     signum: int,
     frame: FrameType | None,
 ) -> None:
-    """Handle Ctrl+C without killing the application."""
 
     if _generating:
+
         raise KeyboardInterrupt
 
     print()
@@ -1530,7 +1508,6 @@ def handle_signal(
 # ============================================================================
 
 def main() -> int:
-    """Start Forza."""
 
     global provider
     global ai
@@ -1549,21 +1526,13 @@ def main() -> int:
         "Loading long-term memory..."
     )
 
-    try:
-        load_memory()
+    load_memory()
 
-        print_system(
-            f"Loaded "
-            f"{len(get_all_memories())} "
-            f"memories."
-        )
-
-    except Exception as exc:
-        print_warning(
-            f"Memory loading failed: {exc}"
-        )
-
-        memory.clear()
+    print_system(
+        f"Loaded "
+        f"{len(get_all_memories())} "
+        f"memories."
+    )
 
     # ------------------------------------------------------------------------
     # 3. RUNTIME
@@ -1576,6 +1545,7 @@ def main() -> int:
     )
 
     try:
+
         runtime.start()
 
         print_system(
@@ -1583,7 +1553,7 @@ def main() -> int:
         )
 
         # --------------------------------------------------------------------
-        # 4. AI INITIALIZATION
+        # 4. AI
         # --------------------------------------------------------------------
 
         ai = create_ai()
@@ -1601,7 +1571,7 @@ def main() -> int:
         )
 
         # --------------------------------------------------------------------
-        # 5. OLLAMA CHECK
+        # 5. OLLAMA
         # --------------------------------------------------------------------
 
         if provider.available():
@@ -1622,7 +1592,7 @@ def main() -> int:
             )
 
         # --------------------------------------------------------------------
-        # 6. BOOT GREETING
+        # 6. GREETING
         # --------------------------------------------------------------------
 
         print()
@@ -1646,8 +1616,10 @@ def main() -> int:
             )
 
             try:
+
                 if runtime.is_running:
                     runtime.stop()
+
             except Exception:
                 pass
 
@@ -1671,6 +1643,7 @@ if __name__ == "__main__":
         signal,
         "SIGTERM",
     ):
+
         signal.signal(
             signal.SIGTERM,
             handle_signal,
