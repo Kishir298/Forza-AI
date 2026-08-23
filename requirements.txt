@@ -18,6 +18,41 @@ python-dotenv
 huggingface-hub
 
 # -------------------------
+# Voice / Audio
+# -------------------------
+numpy
+scipy
+sounddevice
+soundfile
+
+# -------------------------
+# Voice Activity Detection
+# -------------------------
+silero-vad-notorch
+
+# -------------------------
+# Speech-to-Text
+# -------------------------
+faster-whisper
+
+# -------------------------
+# Speaker Recognition
+# -------------------------
+speechbrain
+torch
+torchaudio
+
+# -------------------------
+# Wake Word Detection
+# -------------------------
+openwakeword
+
+# -------------------------
+# Text-to-Speech
+# -------------------------
+kokoro; python_version >= "3.10" and python_version < "3.13"
+
+# -------------------------
 # Windows
 # -------------------------
 pycaw; sys_platform == "win32"
@@ -28,7 +63,6 @@ pywin32; sys_platform == "win32"
 # Linux
 # -------------------------
 # Linux-specific Python dependencies go here.
-# -------------------------
 
 # -------------------------
 # macOS
