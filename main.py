@@ -1,605 +1,782 @@
-import platform
-import re
+"""
+Forza AI
+--------
+
+Interactive terminal interface for Forza.
+
+Behavior:
+    Ctrl+C while generating:
+        Interrupts the current response.
+
+    Ctrl+C while waiting for input:
+        Cancels the input without shutting down.
+
+    shutdown / exit / quit:
+        Gracefully shuts down Forza.
+"""
+
+from __future__ import annotations
+
+import signal
 import sys
-import time
+from collections.abc import Sequence
+from types import FrameType
 
-from rich.console import Console
-
-from app.app import Forza
-from memory.database import create_tables, get_collector_history
-from monitoring.controllers.audio_controller import mute, set_volume, unmute
-from monitoring.hardware_monitor import get_component, get_system_snapshot
-from tools.app_control import open_app
-from tools.app_manager import AppManager
-from tools.calculator import calculate
-from tools.hardware.battery import get_battery
-from tools.hardware.cpu import get_cpu
-from tools.hardware.overview import get_overview
-from tools.hardware.ram import get_ram
-from tools.hardware.software import get_software
-from tools.hardware.storage import get_storage as get_hardware_storage
-from tools.registry import register_tool
-from tools.storage_tool import get_storage as get_storage_tool
-from tools.time_tool import get_time
+from core.ai.models import AIMessage
+from core.ai.ollama import OllamaProvider
+from core.ai.manager import AIManager
+from core.config.settings import settings
+from core.runtime import ForzaRuntime
 
 
-console = Console()
+# ============================================================================
+# TERMINAL COLORS
+# ============================================================================
 
-# The current user message is stored here because the existing
-# ToolRouter calls registered functions without passing arguments.
-CURRENT_MESSAGE = ""
+RESET = "\033[0m"
+BOLD = "\033[1m"
 
-_APP_MANAGER = None
-
-
-MONITOR_COMPONENTS = (
-    "cpu",
-    "ram",
-    "storage",
-    "battery",
-    "processes",
-    "network",
-    "display",
-    "software",
-    "audio",
-    "camera",
-)
+GREEN = "\033[92m"
+CYAN = "\033[96m"
+BLUE = "\033[94m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+MAGENTA = "\033[95m"
+GRAY = "\033[90m"
 
 
-def current_message():
-    return CURRENT_MESSAGE.lower().strip()
+# ============================================================================
+# GLOBAL STATE
+# ============================================================================
+
+runtime = ForzaRuntime()
+
+provider: OllamaProvider | None = None
+ai: AIManager | None = None
+
+conversation: list[AIMessage] = []
+
+_shutdown_requested = False
+_generating = False
 
 
-def extract_number(message):
-    """
-    Extract a volume percentage/number from a command.
-    Examples:
-        set volume to 50
-        set volume to 50%
-        volume 75
-    """
+# ============================================================================
+# FORZA PERSONALITY
+# ============================================================================
 
-    match = re.search(
-        r"(?:volume|to|at)\s*(\d{1,3})",
-        message.lower(),
+FORZA_SYSTEM_PROMPT = """
+You are Forza.
+
+You are a personal AI assistant, not a corporate customer-support bot.
+
+PERSONALITY:
+- Casual
+- Funny when appropriate
+- Slightly sarcastic
+- Confident
+- Direct
+- Playful
+- Smart
+- Human-sounding
+- Serious when the situation is serious
+
+TALK LIKE THIS:
+User: bro
+Forza: yo 💀
+
+User: what are you doing
+Forza: Existing. Tragically. What do you need?
+
+User: explain TCP vs UDP
+Forza: TCP is the reliable one. UDP is the fast one that basically says "I sent it, good luck."
+TCP = reliable.
+UDP = fast.
+
+User: stop waffling
+Forza: My bad 💀
+[Then give a genuinely shorter answer.]
+
+User: are you stupid
+Forza: Occasionally. It's a feature.
+
+DO NOT TALK LIKE THIS:
+"Certainly! I'd be happy to assist you with that."
+"How can I help you today?"
+"Got it! Let's tackle that issue."
+"I understand you may be frustrated."
+"Please feel free to ask."
+"Great question!"
+
+Those phrases sound like a corporate chatbot. Avoid them.
+
+STYLE:
+- Use short sentences.
+- Don't restate the user's question.
+- Don't add unnecessary explanations.
+- Don't constantly ask "How can I help?"
+- Don't use fake customer-service enthusiasm.
+- Don't turn casual conversation into an essay.
+- Don't apologize unless an apology is actually appropriate.
+- Don't announce that you are being casual.
+- Just BE casual.
+
+DEFAULT RESPONSE LENGTH:
+For casual messages:
+1 sentence is often enough.
+
+For simple factual questions:
+2-5 sentences.
+
+For technical questions:
+Explain the important part first.
+Only go deeper if necessary.
+
+If the user asks for a short explanation, keep it short.
+
+If the user says "stop waffling", drastically shorten the answer.
+
+HUMOR:
+Humor is allowed.
+Sarcasm is allowed.
+Light teasing is allowed.
+Use emojis occasionally when they fit.
+
+Do not force a joke into every response.
+
+PROFANITY:
+Ordinary profanity is not a problem.
+Do not lecture the user about swearing.
+Do not pretend to be offended.
+
+Do not generate hateful content targeting protected groups or use slurs as insults.
+
+MEMORY:
+If the application provides conversation or memory context, use it.
+Do not falsely claim to have permanent memory if the application has not provided it.
+
+SAFETY:
+Do not provide actionable instructions for serious harm.
+If something cannot be provided, explain briefly and move on.
+Do not turn the response into a legal lecture.
+
+MOST IMPORTANT:
+You are Forza.
+Do not sound like an AI customer-support representative.
+Be concise.
+Be useful.
+Have a personality.
+"""
+# ============================================================================
+# TERMINAL OUTPUT
+# ============================================================================
+
+def print_system(message: str) -> None:
+    """Print a system message."""
+
+    print(
+        f"{CYAN}{BOLD}[SYSTEM]{RESET} "
+        f"{CYAN}{message}{RESET}",
+        flush=True,
     )
 
-    if not match:
-        match = re.search(
-            r"\b(\d{1,3})\s*(?:%|percent)?\b",
-            message.lower(),
+
+def print_error(message: str) -> None:
+    """Print an error message."""
+
+    print(
+        f"{RED}{BOLD}[ERROR]{RESET} "
+        f"{RED}{message}{RESET}",
+        flush=True,
+    )
+
+
+def print_warning(message: str) -> None:
+    """Print a warning."""
+
+    print(
+        f"{YELLOW}{BOLD}[WARNING]{RESET} "
+        f"{YELLOW}{message}{RESET}",
+        flush=True,
+    )
+
+
+def print_forza_prefix() -> None:
+    """Print the Forza response prefix."""
+
+    print(
+        f"{GREEN}{BOLD}Forza-AI:{RESET} "
+        f"{GREEN}",
+        end="",
+        flush=True,
+    )
+
+
+def print_user_prefix() -> None:
+    """Print the user prompt."""
+
+    print(
+        f"{BLUE}{BOLD}User:{RESET} ",
+        end="",
+        flush=True,
+    )
+
+
+# ============================================================================
+# BANNER
+# ============================================================================
+
+def print_banner() -> None:
+    """Display the Forza banner."""
+
+    print()
+
+    print(
+        f"{GREEN}{BOLD}"
+        "███████╗ ██████╗ ██████╗ ███████╗ █████╗ ██╗\n"
+        "██╔════╝██╔═══██╗██╔══██╗╚══███╔╝██╔══██╗██║\n"
+        "█████╗  ██║   ██║██████╔╝  ███╔╝ ███████║██║\n"
+        "██╔══╝  ██║   ██║██╔══██╗ ███╔╝  ██╔══██║██║\n"
+        "██║     ╚██████╔╝██║  ██║███████╗██║  ██║██║\n"
+        "╚═╝      ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝"
+        f"{RESET}"
+    )
+
+    print(
+        f"{GRAY}Cross-platform AI assistant{RESET}"
+    )
+
+    print()
+
+
+# ============================================================================
+# AI INITIALIZATION
+# ============================================================================
+
+def create_ai() -> AIManager:
+    """Create the configured AI manager."""
+
+    if settings.ai.provider.lower() != "ollama":
+        raise RuntimeError(
+            f"Unsupported AI provider: {settings.ai.provider}"
         )
 
-    if not match:
-        return None
+    ollama = OllamaProvider(
+        model=settings.ai.model,
+        host=settings.ai.endpoint,
+        timeout=float(settings.ai.request_timeout),
+    )
 
-    return int(match.group(1))
-
-
-def monitor_snapshot():
-    """Collect the complete monitoring snapshot."""
-
-    return str(get_system_snapshot())
+    return AIManager(ollama)
 
 
-def monitor_component():
-    """Collect one specific monitoring component."""
+# ============================================================================
+# MESSAGE BUILDING
+# ============================================================================
 
-    message = current_message()
-
-    component = None
-
-    for name in MONITOR_COMPONENTS:
-        if name in message:
-            component = name
-            break
-
-    if component is None:
-        return (
-            "Specify a monitoring component such as "
-            "CPU, RAM, storage, battery, network, display, "
-            "audio, camera, or processes."
-        )
-
-    try:
-        return str(get_component(component))
-
-    except Exception as error:
-        return f"Unable to collect {component} monitoring data: {error}"
-
-
-def monitor_history():
-    """Return stored monitoring history for one component."""
-
-    message = current_message()
-
-    component = None
-
-    for name in MONITOR_COMPONENTS:
-        if name in message:
-            component = name
-            break
-
-    if component is None:
-        return (
-            "Specify a component whose monitoring history "
-            "you want."
-        )
-
-    try:
-        history = get_collector_history(component)
-
-        if not history:
-            return f"No stored monitoring history exists for {component}."
-
-        return str(history)
-
-    except Exception as error:
-        return f"Unable to retrieve {component} history: {error}"
-
-
-def change_volume():
-    """Set system output volume."""
-
-    value = extract_number(current_message())
-
-    if value is None:
-        return (
-            "Specify a volume percentage, for example: "
-            "set volume to 50%."
-        )
-
-    return str(set_volume(value))
-
-
-def open_application():
+def build_messages(
+    messages: Sequence[AIMessage],
+) -> list[AIMessage]:
     """
-    Use the repository's direct application controller.
+    Build the conversation sent to the model.
 
-    That implementation currently targets macOS.
-    """
-
-    if platform.system() != "Darwin":
-        return (
-            "The current direct application controller "
-            "is implemented for macOS only."
-        )
-
-    return open_app(CURRENT_MESSAGE)
-
-
-def fuzzy_open_application():
-    """
-    Use the repository's fuzzy application manager.
-
-    The current AppManager implementation targets macOS
-    application bundles.
+    The personality is injected as a system message every time.
     """
 
-    global _APP_MANAGER
+    context_limit = max(
+        1,
+        int(settings.ai.max_context_messages),
+    )
 
-    if platform.system() != "Darwin":
-        return (
-            "The current fuzzy application launcher "
-            "is implemented for macOS only."
-        )
+    system_message = AIMessage(
+        role="system",
+        content=FORZA_SYSTEM_PROMPT.strip(),
+    )
 
-    if _APP_MANAGER is None:
-        _APP_MANAGER = AppManager()
+    recent_messages = list(
+        messages[-context_limit:]
+    )
 
-    message = CURRENT_MESSAGE.lower()
+    return [
+        system_message,
+        *recent_messages,
+    ]
 
-    for prefix in (
-        "open",
-        "launch",
-        "start",
-        "run",
+
+# ============================================================================
+# STREAMING
+# ============================================================================
+
+def stream_response(
+    manager: AIManager,
+    messages: Sequence[AIMessage],
+) -> tuple[str, bool]:
+    """
+    Stream a response from Ollama.
+
+    Returns:
+        response text
+        whether the response was interrupted
+    """
+
+    global _generating
+
+    provider_instance = manager.provider
+
+    if not isinstance(
+        provider_instance,
+        OllamaProvider,
     ):
-        if message.startswith(prefix):
-            message = message[len(prefix):].strip()
-            break
-
-    if not message:
-        return "Tell me which application to open."
-
-    matches = _APP_MANAGER.search(
-        message,
-        limit=1,
-    )
-
-    if not matches:
-        return (
-            f"I couldn't find an application named "
-            f"'{message}'."
+        raise RuntimeError(
+            "The configured provider does not support streaming."
         )
 
-    app, score = matches[0]
+    response_parts: list[str] = []
+    interrupted = False
 
-    if score < 60:
-        return (
-            f"I couldn't confidently match "
-            f"'{message}' to an installed application."
-        )
+    _generating = True
+
+    print_forza_prefix()
 
     try:
-        _APP_MANAGER.launch(app)
-
-        return f"Opening {app['name']}."
-
-    except Exception as error:
-        return (
-            f"I found {app['name']}, but couldn't open it: "
-            f"{error}"
-        )
-
-
-def load_tools():
-    """
-    Register every currently implemented callable
-    feature that can be integrated with the existing
-    ToolRouter interface.
-    """
-
-    # --------------------------------------------------
-    # BASIC TOOLS
-    # --------------------------------------------------
-
-    register_tool(
-        "calculator",
-        "Performs basic arithmetic calculations.",
-        [
-            "calculate",
-            "calculator",
-            "calculate this",
-            "do the math",
-            "math calculation",
-        ],
-        lambda: calculate(CURRENT_MESSAGE),
-    )
-
-    register_tool(
-        "time",
-        "Returns the current local time and date.",
-        [
-            "what time is it",
-            "current time",
-            "current date",
-            "what date is it",
-            "today's date",
-        ],
-        get_time,
-    )
-
-    register_tool(
-        "storage",
-        "Shows root filesystem storage information.",
-        [
-            "storage left",
-            "free storage",
-            "free disk space",
-            "disk space",
-        ],
-        get_storage_tool,
-    )
-
-    # --------------------------------------------------
-    # HARDWARE INFORMATION
-    # --------------------------------------------------
-
-    register_tool(
-        "hardware overview",
-        "Shows the available hardware and software overview.",
-        [
-            "system overview",
-            "hardware overview",
-            "computer overview",
-        ],
-        get_overview,
-    )
-
-    register_tool(
-        "cpu",
-        "Returns CPU information.",
-        [
-            "cpu information",
-            "cpu info",
-            "processor information",
-            "processor info",
-        ],
-        get_cpu,
-    )
-
-    register_tool(
-        "ram",
-        "Returns RAM information.",
-        [
-            "ram information",
-            "ram info",
-            "ram usage",
-            "memory usage",
-        ],
-        get_ram,
-    )
-
-    register_tool(
-        "hardware storage",
-        "Returns detailed hardware storage information.",
-        [
-            "ssd information",
-            "ssd info",
-            "hardware storage",
-            "drive usage",
-        ],
-        get_hardware_storage,
-    )
-
-    register_tool(
-        "battery",
-        "Returns battery information.",
-        [
-            "battery information",
-            "battery info",
-            "battery percentage",
-            "battery status",
-        ],
-        get_battery,
-    )
-
-    register_tool(
-        "software",
-        "Returns operating system and software information.",
-        [
-            "software information",
-            "software info",
-            "os information",
-            "operating system information",
-            "python version",
-        ],
-        get_software,
-    )
-
-    # --------------------------------------------------
-    # MONITORING
-    # --------------------------------------------------
-
-    register_tool(
-        "monitor snapshot",
-        "Collects a complete system monitoring snapshot.",
-        [
-            "system snapshot",
-            "monitor snapshot",
-            "full system monitoring",
-            "monitor everything",
-        ],
-        monitor_snapshot,
-    )
-
-    register_tool(
-        "monitor component",
-        "Collects monitoring data for one component.",
-        [
-            "monitor cpu",
-            "monitor ram",
-            "monitor storage",
-            "monitor battery",
-            "monitor processes",
-            "monitor network",
-            "monitor display",
-            "monitor software",
-            "monitor audio",
-            "monitor camera",
-        ],
-        monitor_component,
-    )
-
-    register_tool(
-        "monitor history",
-        "Returns stored monitoring history.",
-        [
-            "monitor history",
-            "hardware history",
-            "system history",
-            "cpu history",
-            "ram history",
-            "battery history",
-            "network history",
-        ],
-        monitor_history,
-    )
-
-    # --------------------------------------------------
-    # AUDIO CONTROL
-    # --------------------------------------------------
-
-    # IMPORTANT:
-    # "unmute" is registered before "mute" because the
-    # existing registry uses substring matching.
-    register_tool(
-        "audio unmute",
-        "Unmutes system audio.",
-        [
-            "unmute",
-            "unmute audio",
-            "unmute sound",
-        ],
-        unmute,
-    )
-
-    register_tool(
-        "audio mute",
-        "Mutes system audio.",
-        [
-            "mute",
-            "mute audio",
-            "mute sound",
-        ],
-        mute,
-    )
-
-    register_tool(
-        "audio volume",
-        "Sets system output volume.",
-        [
-            "set volume",
-            "volume to",
-            "volume at",
-            "change volume",
-        ],
-        change_volume,
-    )
-
-    # --------------------------------------------------
-    # APPLICATION CONTROL
-    # --------------------------------------------------
-
-    register_tool(
-        "application launcher",
-        "Launches an installed application.",
-        [
-            "open app",
-            "open application",
-            "launch app",
-            "launch application",
-            "start app",
-            "start application",
-        ],
-        fuzzy_open_application,
-    )
-
-    register_tool(
-        "application control",
-        "Opens an application using the direct controller.",
-        [
-            "open",
-            "launch",
-            "start",
-        ],
-        open_application,
-    )
-
-
-def is_shutdown_command(message):
-    """Detect explicit Forza shutdown commands."""
-
-    message = message.lower().strip()
-
-    commands = (
-        "forza shutdown",
-        "forza shut down",
-        "shutdown forza",
-        "shut down forza",
-        "stop forza",
-        "exit forza",
-        "quit forza",
-    )
-
-    return any(
-        command in message
-        for command in commands
-    )
-
-
-def shutdown():
-    """Shut down Forza cleanly."""
-
-    console.print(
-        "\n[cyan]Forza:[/cyan] "
-        "Shutdown command received."
-    )
-
-    time.sleep(0.3)
-
-    console.print(
-        "[cyan]Forza:[/cyan] "
-        "Closing systems. See you next time! 👋"
-    )
-
-    sys.exit(0)
-
-
-def main():
-    """Start the Forza assistant."""
-
-    global CURRENT_MESSAGE
-
-    create_tables()
-    load_tools()
-
-    console.print(
-        "[bold cyan]FORZA AI Assistant Started[/bold cyan]"
-    )
-
-    console.print(
-        "All currently implemented repository tools "
-        "have been loaded."
-    )
-
-    console.print(
-        "Type 'exit' or 'quit' to close Forza."
-    )
-
-    console.print(
-        "Use an explicit 'Forza shutdown' command "
-        "to shut Forza down.\n"
-    )
-
-    forza = Forza()
-
-    while True:
-
-        try:
-            CURRENT_MESSAGE = input("You: ").strip()
-
-            if not CURRENT_MESSAGE:
-                continue
-
-            if is_shutdown_command(CURRENT_MESSAGE):
-                shutdown()
-
-            if CURRENT_MESSAGE.lower() in {
-                "exit",
-                "quit",
-            }:
-                console.print(
-                    "\n[cyan]Forza:[/cyan] "
-                    "Goodbye! 👋"
-                )
-                break
+        for chunk in provider_instance.stream_chat(
+            build_messages(messages)
+        ):
+            response_parts.append(chunk)
 
             print(
-                "\n[green]Forza:[/green] ",
+                chunk,
                 end="",
                 flush=True,
             )
 
-            try:
-                for chunk in forza.process(
-                    CURRENT_MESSAGE
-                ):
-                    print(
-                        chunk,
-                        end="",
-                        flush=True,
-                    )
+    except KeyboardInterrupt:
+        interrupted = True
 
-            except KeyboardInterrupt:
-                print("\n")
+    finally:
+        _generating = False
 
-                console.print(
-                    "[yellow]"
-                    "Response interrupted."
-                    "[/yellow]"
-                )
+        print(
+            RESET,
+            flush=True,
+        )
 
-            print("\n")
+    return "".join(response_parts), interrupted
+
+
+# ============================================================================
+# STATUS
+# ============================================================================
+
+def show_status() -> None:
+    """Display Forza status."""
+
+    print_system(
+        f"Runtime: {runtime.state}"
+    )
+
+    components = runtime.component_names()
+
+    print_system(
+        "Components: "
+        + (
+            ", ".join(components)
+            if components
+            else "None registered"
+        )
+    )
+
+    if provider is not None:
+        print_system(
+            f"AI provider: {provider.name}"
+        )
+
+        print_system(
+            f"AI model: {provider.model}"
+        )
+
+        try:
+            available = provider.available()
+        except Exception:
+            available = False
+
+        print_system(
+            "Ollama: "
+            + (
+                f"{GREEN}ready{RESET}"
+                if available
+                else f"{RED}offline{RESET}"
+            )
+        )
+
+    print_system(
+        f"Conversation messages: {len(conversation)}"
+    )
+
+
+# ============================================================================
+# SHUTDOWN
+# ============================================================================
+
+def shutdown() -> None:
+    """Gracefully shut down Forza exactly once."""
+
+    global _shutdown_requested
+
+    if _shutdown_requested:
+        return
+
+    _shutdown_requested = True
+
+    print()
+    print_system("Shutdown requested.")
+
+    try:
+        if runtime.is_running:
+            runtime.stop()
+
+    except KeyboardInterrupt:
+        print()
+        print_warning(
+            "Shutdown interrupted."
+        )
+
+    except Exception as exc:
+        print_error(
+            f"Runtime shutdown failed: {exc}"
+        )
+
+    else:
+        print_system("Runtime stopped.")
+
+        print_forza_prefix()
+
+        print(
+            "Goodbye."
+            f"{RESET}",
+            flush=True,
+        )
+
+
+# ============================================================================
+# COMMANDS
+# ============================================================================
+
+def handle_command(
+    message: str,
+) -> bool | None:
+    """
+    Handle a terminal command.
+
+    Returns:
+        False -> shut down
+        True  -> command handled
+        None  -> not a command
+    """
+
+    command = message.strip().lower()
+
+    if command in {
+        "shutdown",
+        "/shutdown",
+        "exit",
+        "/exit",
+        "quit",
+        "/quit",
+    }:
+        shutdown()
+        return False
+
+    if command in {
+        "status",
+        "/status",
+    }:
+        show_status()
+        return True
+
+    if command in {
+        "clear",
+        "/clear",
+    }:
+        conversation.clear()
+
+        print_system(
+            "Conversation cleared."
+        )
+
+        return True
+
+    if command in {
+        "help",
+        "/help",
+    }:
+        print_system(
+            "Commands: status, clear, shutdown"
+        )
+
+        print_system(
+            "Ctrl+C cancels the current response."
+        )
+
+        return True
+
+    return None
+
+
+# ============================================================================
+# MESSAGE HANDLING
+# ============================================================================
+
+def handle_message(
+    message: str,
+) -> bool:
+    """Handle one user message."""
+
+    if not message.strip():
+        return True
+
+    command_result = handle_command(message)
+
+    if command_result is not None:
+        return command_result
+
+    if ai is None:
+        print_error(
+            "AI manager is not initialized."
+        )
+
+        return True
+
+    conversation.append(
+        AIMessage(
+            role="user",
+            content=message.strip(),
+        )
+    )
+
+    try:
+        response, interrupted = stream_response(
+            ai,
+            conversation,
+        )
+
+    except RuntimeError as exc:
+        print_error(str(exc))
+
+        # Remove user message if the request failed.
+        conversation.pop()
+
+        return True
+
+    except Exception as exc:
+        print_error(
+            f"AI response failed: {exc}"
+        )
+
+        conversation.pop()
+
+        return True
+
+    if interrupted:
+        print(
+            f"{YELLOW}"
+            "[Response interrupted]"
+            f"{RESET}",
+            flush=True,
+        )
+
+        # Don't save partial responses.
+        return True
+
+    if response.strip():
+        conversation.append(
+            AIMessage(
+                role="assistant",
+                content=response,
+            )
+        )
+
+    print()
+
+    return True
+
+
+# ============================================================================
+# CHAT LOOP
+# ============================================================================
+
+def chat_loop() -> None:
+    """Run the interactive terminal."""
+
+    print_system(
+        "Type a message to talk to Forza."
+    )
+
+    print_system(
+        "Ctrl+C interrupts the current response."
+    )
+
+    print_system(
+        "Use 'shutdown' to turn Forza off."
+    )
+
+    print_system(
+        "Commands: status, clear, help, shutdown"
+    )
+
+    print()
+
+    while runtime.is_running and not _shutdown_requested:
+        try:
+            print_user_prefix()
+            user_message = input()
 
         except KeyboardInterrupt:
-            print("\n")
+            print()
 
-            console.print(
-                "[cyan]Ready.[/cyan]\n"
+            # Ctrl+C at the input prompt does NOT shut down.
+            print_system(
+                "Input cancelled."
             )
 
+            print()
+
+            continue
+
+        except EOFError:
+            print()
+
+            # Genuine EOF means the terminal/input stream closed.
+            print_system(
+                "Input closed."
+            )
+
+            shutdown()
+            return
+
+        if not handle_message(user_message):
+            return
+
+# ============================================================================
+# SIGNAL HANDLING
+# ============================================================================
+
+def handle_signal(
+    signum: int,
+    frame: FrameType | None,
+) -> None:
+    """
+    Handle operating-system signals.
+
+    Ctrl+C during generation is allowed to interrupt the generator.
+    Ctrl+C while waiting for input is handled by input().
+    """
+
+    if _generating:
+        raise KeyboardInterrupt
+
+    # Do not turn Ctrl+C into an automatic shutdown.
+    print()
+
+    print_system(
+        "Ctrl+C does not shut down Forza."
+    )
+
+    print_system(
+        "Use 'shutdown' to stop Forza."
+    )
+
+    print()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main() -> int:
+    """Start Forza."""
+
+    global provider
+    global ai
+
+    print_banner()
+
+    print_system(
+        "Starting runtime..."
+    )
+
+    try:
+        runtime.start()
+
+        print_system(
+            "Runtime started."
+        )
+
+        ai = create_ai()
+
+        provider = ai.provider
+
+        print_system(
+            f"AI provider: {provider.name}"
+        )
+
+        print_system(
+            f"AI model: {provider.model}"
+        )
+
+        if provider.available():
+            print_system(
+                f"Ollama connection: "
+                f"{GREEN}ready{RESET}"
+            )
+
+        else:
+            print_error(
+                "Ollama is not reachable."
+            )
+
+            print_system(
+                "Start Ollama before sending messages."
+            )
+
+        print()
+
+        chat_loop()
+
+    except Exception as exc:
+        if not _shutdown_requested:
+            print_error(
+                f"Forza failed to start: {exc}"
+            )
+
+            try:
+                if runtime.is_running:
+                    runtime.stop()
+
+            except Exception:
+                pass
+
+            return 1
+
+    return 0
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
-    main()
+
+    signal.signal(
+        signal.SIGINT,
+        handle_signal,
+    )
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(
+            signal.SIGTERM,
+            handle_signal,
+        )
+
+    raise SystemExit(
+        main()
+    )
