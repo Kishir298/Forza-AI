@@ -68,3 +68,5 @@ pywin32; sys_platform == "win32"
 # macOS
 # -------------------------
 # macOS-specific dependencies will be added only when required.
+
+numpy
