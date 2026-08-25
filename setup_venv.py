@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import platform
 import subprocess
 import sys
@@ -8,55 +7,61 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-VENV = ROOT / ".venv"
 
 
-def get_venv_python() -> Path:
+def get_venv_path() -> Path:
+    system = platform.system()
+
+    if system == "Windows":
+        return ROOT / ".venv-windows"
+
+    if system == "Linux":
+        return ROOT / ".venv-linux"
+
+    if system == "Darwin":
+        return ROOT / ".venv-macos"
+
+    raise RuntimeError(f"Unsupported operating system: {system}")
+
+
+def get_python_path(venv: Path) -> Path:
     if platform.system() == "Windows":
-        return VENV / "Scripts" / "python.exe"
+        return venv / "Scripts" / "python.exe"
 
-    return VENV / "bin" / "python"
+    return venv / "bin" / "python"
 
 
-def create_venv() -> None:
-    print("Creating Forza AI virtual environment...")
-
+def create_venv(venv: Path) -> None:
+    print(f"Creating virtual environment: {venv.name}")
     subprocess.check_call(
-        [sys.executable, "-m", "venv", str(VENV)]
+        [sys.executable, "-m", "venv", str(venv)]
     )
 
 
 def main() -> None:
     system = platform.system()
-
-    if system not in {"Windows", "Darwin", "Linux"}:
-        print(f"Unsupported operating system: {system}")
-        sys.exit(1)
+    venv = get_venv_path()
+    python = get_python_path(venv)
 
     print(f"Detected OS: {system}")
+    print(f"Environment: {venv.name}")
 
-    python_path = get_venv_python()
-
-    if python_path.exists():
+    if python.exists():
         print("Virtual environment already exists.")
     else:
-        create_venv()
+        create_venv(venv)
 
     print()
     print("Forza AI virtual environment: READY")
-    print(f"Python: {python_path}")
+    print(f"Python: {python}")
 
     print()
     print("Activate it with:")
 
     if system == "Windows":
-        print(r"  .venv\Scripts\activate")
+        print(f"  source {venv.name}/Scripts/activate")
     else:
-        print("  source .venv/bin/activate")
-
-    print()
-    print("Or run Python directly with:")
-    print(f"  {python_path}")
+        print(f"  source {venv.name}/bin/activate")
 
 
 if __name__ == "__main__":
