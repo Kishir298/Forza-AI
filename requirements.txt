@@ -69,4 +69,11 @@ pywin32; sys_platform == "win32"
 # -------------------------
 # macOS-specific dependencies will be added only when required.
 
-numpy
+# -------------------------
+# Memory Cloud Backend
+# -------------------------
+fastapi
+uvicorn
+sqlalchemy
+psycopg[binary]
+pydantic-settings
