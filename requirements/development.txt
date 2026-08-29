@@ -1,3 +1,5 @@
-pytest
-black
+# A.S.I.S. development tooling.
+pytest>=8
+pytest-cov>=5
 ruff
+black

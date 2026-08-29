@@ -1,0 +1,5 @@
+# A.S.I.S. base runtime dependencies.
+# These are lightweight and always required.
+platformdirs>=4
+psutil>=5.9
+python-dotenv>=1.0

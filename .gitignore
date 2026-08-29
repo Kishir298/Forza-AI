@@ -1,5 +1,8 @@
 # Python virtual environments
 .venv/
+.venv-windows/
+.venv-linux/
+.venv-macos/
 venv/
 env/
 
@@ -8,18 +11,24 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
 # Environment variables / secrets
 .env
 .env.*
 !.env.example
+*.pem
+*.key
 
-# VS Code
+# VS Code / IDEs
 .vscode/
+.idea/
 
-# macOS
+# macOS / Windows
 .DS_Store
-
-# Windows
 Thumbs.db
 
 # Logs
@@ -28,16 +37,40 @@ Thumbs.db
 # AI / model files
 models/
 model/
-.cache/
+*.gguf
+*.safetensors
+*.bin
+
+# Audio recordings / generated audio
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+!tests/fixtures/**
+!docs/samples/**
+
+# Speaker embeddings / generated vectors
+speaker_embeddings/
+*.npy
+*.npz
 
 # Python tooling
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 
-# Runtime databases
+# Coverage
+.coverage
+htmlcov/
+xmlcov/
+
+# Runtime databases / temp data
 *.db
 *.sqlite
 *.sqlite3
+*.tmp
 
-# Forza persistent user memory
-data/memory/memories.json
+# ASIS persistent user data (lives outside the repo)
+data/
+runtime/
