@@ -2,6 +2,9 @@
 A.S.I.S. AI subsystem.
 """
 
+from .context import ContextAssembler
+from .conversation import ConversationSession
+from .inference import InferenceEngine
 from .manager import AIManager, create_provider
 from .models import AIMessage, AIResponse, MessageRole
 from .providers import AIProvider, MockAIProvider, OllamaProvider
@@ -15,4 +18,7 @@ __all__ = [
     "AIProvider",
     "MockAIProvider",
     "OllamaProvider",
+    "ConversationSession",
+    "ContextAssembler",
+    "InferenceEngine",
 ]
